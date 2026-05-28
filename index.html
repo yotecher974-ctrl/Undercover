@@ -419,7 +419,7 @@
 <!-- ══════ SCREEN: LOBBY ══════ -->
 <div class="screen" id="screen-lobby">
   <div class="header">
-    <button class="back-btn" onclick="leaveRoom()">← Quitter</button>
+    <button class="back-btn" onclick="askQuitGame()">← Quitter</button>
     <div class="logo">LOBBY</div>
     <div style="width:40px;"></div>
   </div>
@@ -448,7 +448,7 @@
 <!-- ══════ SCREEN: ONLINE REVEAL ══════ -->
 <div class="screen" id="screen-online-reveal">
   <div class="header">
-    <div style="width:40px;"></div>
+    <button class="icon-btn" onclick="askQuitGame()" title="Quitter la partie" style="color:var(--red);">🚪</button>
     <div class="logo">VOTRE CARTE</div>
     <div style="width:40px;"></div>
   </div>
@@ -460,7 +460,7 @@
 <!-- ══════ SCREEN: ONLINE GAME ══════ -->
 <div class="screen" id="screen-online-game">
   <div class="header">
-    <div style="width:40px;"></div>
+    <button class="icon-btn" onclick="askQuitGame()" title="Quitter la partie" style="color:var(--red);">🚪</button>
     <div class="logo" id="online-game-logo">PARTIE</div>
     <div style="width:40px;"></div>
   </div>
@@ -686,6 +686,19 @@
   </div>
 </div>
 
+<!-- ══════ MODAL: CONFIRM QUIT ══════ -->
+<div id="confirm-quit-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:9999; align-items:center; justify-content:center; padding:24px;">
+  <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:28px 24px; max-width:340px; width:100%; text-align:center; animation:popIn 0.2s ease;">
+    <div style="font-size:40px; margin-bottom:12px;">🚪</div>
+    <div style="font-family:'Bebas Neue',sans-serif; font-size:24px; letter-spacing:2px; margin-bottom:8px;">Quitter la partie ?</div>
+    <div style="color:var(--muted); font-size:14px; line-height:1.5; margin-bottom:24px;">Tu vas quitter la partie en cours.<br>Les autres joueurs continueront sans toi.</div>
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <button class="btn btn-danger" onclick="confirmQuitGame()">🚪 Oui, quitter</button>
+      <button class="btn btn-secondary" onclick="closeQuitModal()">Rester dans la partie</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ══════════════════════════════════════════════════════════════
 // WORD PAIRS
@@ -761,7 +774,7 @@ async function tryRestoreSession() {
     if (!room.players || !room.players[myId]) {
       const playerData = { id: myId, name: myName, isHost: isHost, alive: true, role: null, word: null, ready: false };
       await fbSet('/rooms/' + roomCode + '/players/' + myId, playerData);
-      await fbUpdate('/rooms/' + roomCode, { _v: Date.now() });
+      await fbUpdate('/rooms/' + roomCode, { _v: Date.now() + (Math.random() * 999 | 0) });
     }
     // Start live listener — handles initial render + continuous updates
     fbListen('/rooms/' + roomCode, (r) => { if (r) onRoomState(r); });
@@ -877,86 +890,46 @@ async function fbDelete(path) {
   } catch {}
 }
 
-// ── change detection: deep hash of the full room state ────────
+// ── change detection hash ────────────────────────────────────
 function roomHash(data) {
-  // Stringify the full object so ANY field change is detected
   try { return JSON.stringify(data); }
   catch { return String(Date.now()); }
 }
 
-// ── real-time listener ────────────────────────────────────────
-// Strategy: SSE (Firebase EventSource) as primary, polling as fallback/safety net.
-// IMPORTANT: we NEVER skip a callback based on "already seen" — every change fires.
+// ── real-time listener ─────────────────────────────────────────
+// Pure polling — works reliably on ALL browsers (desktop + mobile).
+// Firebase SSE (EventSource) is not reliable from plain HTML files on desktop
+// browsers due to CORS/connection handling differences.
+// At 800ms the latency is imperceptible for a turn-based game.
 function fbListen(path, callback) {
   stopListening();
   fbListenPath = path;
   fbListenCb = callback;
   let lastHash = null;
+  let isPolling = false;
 
-  // --- SSE (instant push from Firebase) ---
-  const startSSE = () => {
-    try {
-      fbSource = new EventSource(`${FB}${path}.json`);
-
-      let sseDebounce = null;
-      const sseFlush = () => {
-        fbGet(path).then(full => {
-          if (!full) return;
-          const h = roomHash(full);
-          if (h !== lastHash) { lastHash = h; callback(full); }
-        });
-      };
-      const sseSchedule = () => {
-        clearTimeout(sseDebounce);
-        sseDebounce = setTimeout(sseFlush, 150); // batch rapid writes
-      };
-
-      fbSource.addEventListener('put', (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (!msg || msg.data === null) return;
-          // For root-level puts with full data, use directly (faster)
-          if (msg.path === '/' && msg.data && typeof msg.data === 'object') {
-            const h = roomHash(msg.data);
-            if (h !== lastHash) { lastHash = h; callback(msg.data); }
-          } else {
-            // Child update — fetch full room with debounce
-            sseSchedule();
-          }
-        } catch {}
-      });
-
-      fbSource.addEventListener('patch', (e) => {
-        sseSchedule(); // partial update — always re-fetch
-      });
-
-      fbSource.onerror = () => {
-        if (fbSource) { fbSource.close(); fbSource = null; }
-        // Restart SSE after a short delay
-        setTimeout(() => { if (fbListenPath && fbListenCb) startSSE(); }, 3000);
-      };
-    } catch {}
-  };
-
-  startSSE();
-
-  // --- Polling fallback (catches anything SSE misses, every 2s) ---
-  fbPollTimer = setInterval(async () => {
+  const poll = async () => {
+    if (isPolling) return; // prevent overlapping requests
+    isPolling = true;
     try {
       const data = await fbGet(path);
-      if (!data) return;
+      if (data === null || data === undefined) return;
       const h = roomHash(data);
-      if (h !== lastHash) { lastHash = h; callback(data); }
-    } catch {}
-  }, 2000);
+      if (h !== lastHash) {
+        lastHash = h;
+        callback(data);
+      }
+    } catch(e) {
+      console.warn('[fbListen] poll error:', e);
+    } finally {
+      isPolling = false;
+    }
+  };
 
-  // First immediate fetch (show current state right away)
-  fbGet(path).then(data => {
-    if (!data) return;
-    const h = roomHash(data);
-    lastHash = h; // seed the hash — but DO call the callback to render
-    callback(data);
-  });
+  // Immediate first fetch + render
+  poll();
+  // Then poll every 800ms
+  fbPollTimer = setInterval(poll, 800);
 }
 
 function stopListening() {
@@ -991,7 +964,7 @@ async function connectToRoom(code, name, asHost) {
       clueOrder: [], clueIndex: 0,
       innocentWord: '', impostorWord: '',
       winner: null, voteTimerEnd: null, discussEnd: null,
-      _v: Date.now()
+      _v: Date.now() + (Math.random() * 999 | 0)
     };
     const ok = await fbSet(`/rooms/${roomCode}`, room);
     if (!ok && ok !== false) {
@@ -1024,7 +997,7 @@ async function connectToRoom(code, name, asHost) {
   // Add self to players (and bump _v so all listeners detect the change)
   const playerData = { id: myId, name, isHost: asHost, alive: true, role: null, word: null, ready: false };
   await fbSet(`/rooms/${roomCode}/players/${myId}`, playerData);
-  await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() });
+  await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() + (Math.random() * 999 | 0) });
 
   // Save session so page refresh can restore the game
   saveSession();
@@ -1036,6 +1009,12 @@ async function connectToRoom(code, name, asHost) {
   });
 }
 
+function onClickReady(btn) {
+  btn.disabled = true;
+  btn.textContent = '⏳ En attente des autres joueurs...';
+  send({ type: 'ready' });
+}
+
 async function send(action) {
   // Actions are performed directly on Firebase
   // Host processes them; non-host writes their own data
@@ -1043,6 +1022,8 @@ async function send(action) {
 
   if (action.type === 'ready') {
     await fbUpdate(`/rooms/${roomCode}/players/${myId}`, { ready: true });
+    // Bump room _v so all listeners (especially host) detect the change
+    await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() + (Math.random() * 999 | 0) + Math.random() });
     if (isHost) await checkAllReady();
   }
   else if (action.type === 'send_clue') {
@@ -1099,7 +1080,7 @@ async function hostDoStartGame() {
     clues: {}, votes: {},
     clueOrder: [], clueIndex: 0,
     winner: null, voteTimerEnd: null, discussEnd: null,
-    _v: Date.now()
+    _v: Date.now() + (Math.random() * 999 | 0)
   });
 }
 
@@ -1118,7 +1099,7 @@ async function hostDoStartClues(room) {
   const alive = Object.values(room.players||{}).filter(p=>p.alive);
   const order = shuffle(alive.map(p => p.id));
   await fbUpdate(`/rooms/${roomCode}`, {
-    phase: 'clues', clueOrder: order, clueIndex: 0, clues: {}, _v: Date.now()
+    phase: 'clues', clueOrder: order, clueIndex: 0, clues: {}, _v: Date.now() + (Math.random() * 999 | 0)
   });
 }
 
@@ -1132,7 +1113,7 @@ async function advanceClue(fromId) {
   if (newIndex >= order.length) {
     await hostDoStartDiscussion();
   } else {
-    await fbUpdate(`/rooms/${roomCode}`, { clueIndex: newIndex, _v: Date.now() });
+    await fbUpdate(`/rooms/${roomCode}`, { clueIndex: newIndex, _v: Date.now() + (Math.random() * 999 | 0) });
   }
 }
 
@@ -1140,14 +1121,14 @@ async function hostDoStartDiscussion() {
   const cfg = onlineRoom?.config || (await fbGet(`/rooms/${roomCode}/config`));
   const discussDur = cfg?.discuss || 120;
   const end = Date.now() + discussDur * 1000;
-  await fbUpdate(`/rooms/${roomCode}`, { phase: 'discussion', discussEnd: end, _v: Date.now() });
+  await fbUpdate(`/rooms/${roomCode}`, { phase: 'discussion', discussEnd: end, _v: Date.now() + (Math.random() * 999 | 0) });
   clearTimers();
   discussTimer = setTimeout(() => { if (isHost) hostDoStartVote(); }, discussDur * 1000);
 }
 
 async function hostDoStartVote() {
   const end = Date.now() + 45000;
-  await fbUpdate(`/rooms/${roomCode}`, { phase: 'vote', votes: {}, voteTimerEnd: end, _v: Date.now() });
+  await fbUpdate(`/rooms/${roomCode}`, { phase: 'vote', votes: {}, voteTimerEnd: end, _v: Date.now() + (Math.random() * 999 | 0) });
   clearTimers();
   voteTimer = setTimeout(() => { if (isHost) resolveVote(); }, 45000);
 }
@@ -1181,9 +1162,9 @@ async function resolveVote() {
 
   const newRound = (room.round||1) + 1;
   if (mrWhiteElim) {
-    await fbSet(`/rooms/${roomCode}`, { ...room, players, round: newRound, phase: 'mrwhite_guess', votes:{}, voteTimerEnd:null, mrWhiteId:eliminatedId, _v:Date.now() });
+    await fbSet(`/rooms/${roomCode}`, { ...room, players, round: newRound, phase: 'mrwhite_guess', votes:{}, voteTimerEnd:null, mrWhiteId:eliminatedId, _v: Date.now() + (Math.random() * 999 | 0) });
   } else {
-    await fbSet(`/rooms/${roomCode}`, { ...room, players, round: newRound, votes:{}, voteTimerEnd:null, _v:Date.now() });
+    await fbSet(`/rooms/${roomCode}`, { ...room, players, round: newRound, votes:{}, voteTimerEnd:null, _v: Date.now() + (Math.random() * 999 | 0) });
     await checkEndConditionsOnline(players, room);
   }
   } catch(e) { console.error('resolveVote error', e); }
@@ -1195,8 +1176,8 @@ async function checkEndConditionsOnline(players, room) {
   const impostors = alive.filter(p=>p.role==='impostor');
   const suspects = alive.filter(p=>p.role==='impostor'||p.role==='mrwhite');
   const innocents = alive.filter(p=>p.role==='innocent');
-  if (suspects.length===0) { await fbUpdate(`/rooms/${roomCode}`, {phase:'end', winner:'innocents', _v:Date.now()}); return; }
-  if (impostors.length>0 && innocents.length<=impostors.length) { await fbUpdate(`/rooms/${roomCode}`, {phase:'end', winner:'impostor', _v:Date.now()}); return; }
+  if (suspects.length===0) { await fbUpdate(`/rooms/${roomCode}`, {phase:'end', winner:'innocents', _v: Date.now() + (Math.random() * 999 | 0)}); return; }
+  if (impostors.length>0 && innocents.length<=impostors.length) { await fbUpdate(`/rooms/${roomCode}`, {phase:'end', winner:'impostor', _v: Date.now() + (Math.random() * 999 | 0)}); return; }
   await hostDoStartClues({ ...room, players });
 }
 
@@ -1205,7 +1186,7 @@ async function submitMrWhiteGuessOnline(guess) {
   if (!room) return;
   const correct = room.innocentWord||'';
   if (guess.toLowerCase() === correct.toLowerCase()) {
-    await fbUpdate(`/rooms/${roomCode}`, { phase:'end', winner:'mrwhite', _v:Date.now() });
+    await fbUpdate(`/rooms/${roomCode}`, { phase:'end', winner:'mrwhite', _v: Date.now() + (Math.random() * 999 | 0) });
   } else {
     const players = room.players || {};
     await checkEndConditionsOnline(players, room);
@@ -1219,7 +1200,7 @@ async function hostDoRematch() {
   Object.entries(room.players||{}).forEach(([id,p]) => {
     players[id] = { ...p, alive:true, role:null, word:null, ready:false };
   });
-  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, votes:{}, clueOrder:[], clueIndex:0, round:0, _v:Date.now() });
+  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, votes:{}, clueOrder:[], clueIndex:0, round:0, _v: Date.now() + (Math.random() * 999 | 0) });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1340,15 +1321,30 @@ async function joinRoom() {
   // connectToRoom handles showScreen and errors internally
 }
 
+function askQuitGame() {
+  const modal = document.getElementById('confirm-quit-modal');
+  modal.style.display = 'flex';
+}
+function closeQuitModal() {
+  document.getElementById('confirm-quit-modal').style.display = 'none';
+}
+// Close quit modal on Escape key (desktop UX)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeQuitModal();
+});
+function confirmQuitGame() {
+  closeQuitModal();
+  leaveRoom();
+}
+
 async function leaveRoom() {
   stopListening();
   clearTimers();
   if (roomCode && myId) {
-    // Remove ourselves from the room
     try {
       await fbDelete(`/rooms/${roomCode}/players/${myId}`);
       // Bump _v so remaining players see the leave
-      await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() });
+      await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() + (Math.random() * 999 | 0) });
       // If host leaves and game hasn't started, delete entire room
       if (isHost && onlineRoom && onlineRoom.phase === 'lobby') {
         await fbDelete(`/rooms/${roomCode}`);
@@ -1462,6 +1458,9 @@ function renderOnlineReveal(room) {
     ? `<div class="the-word empty">???</div>`
     : `<div class="the-word">${(word||'').toUpperCase()}</div>`;
 
+  // Check if I already clicked ready
+  const meReady = me.ready === true;
+
   container.innerHTML = `
     <div style="text-align:center;">
       <div class="reveal-player-name">${me.name}</div>
@@ -1470,8 +1469,13 @@ function renderOnlineReveal(room) {
         <div class="word-label">VOTRE MOT</div>
         ${wordHtml}
       </div>
-      <div style="margin-top:24px; color:var(--muted); font-size:13px;">En attente des autres joueurs...</div>
-      <button class="btn btn-primary" style="margin-top:20px; max-width:280px;" onclick="send({type:'ready'})">✅ J'ai vu mon mot</button>
+      ${meReady
+        ? `<div style="margin-top:24px; color:var(--accent); font-size:14px; font-weight:600;">✅ En attente des autres joueurs...</div>`
+        : `<button class="btn btn-primary" style="margin-top:20px; max-width:280px;" onclick="onClickReady(this)">✅ J'ai vu mon mot</button>`
+      }
+      <div style="margin-top:16px; font-size:12px; color:var(--muted);">
+        ${(room.players||[]).filter(p=>p.alive&&p.ready).length} / ${(room.players||[]).filter(p=>p.alive).length} joueurs prêts
+      </div>
     </div>
   `;
 }
