@@ -724,16 +724,58 @@ let myClue = null;
 let voteTimer = null;
 let discussTimer = null;
 let clueTimer = null;
+let countdownInterval = null;
+let isResolvingVote = false;
+
+// ══════════════════════════════════════════════════════════════
+// SESSION PERSISTENCE (survive page refresh in-game)
+// ══════════════════════════════════════════════════════════════
+function saveSession() {
+  if (roomCode && myId) {
+    sessionStorage.setItem('uc_session', JSON.stringify({ roomCode, myId, myName, isHost }));
+  }
+}
+function clearSession() {
+  sessionStorage.removeItem('uc_session');
+}
+async function tryRestoreSession() {
+  if (!FB) return false;
+  const raw = sessionStorage.getItem('uc_session');
+  if (!raw) return false;
+  try {
+    const s = JSON.parse(raw);
+    if (!s.roomCode || !s.myId) return false;
+    const room = await fbGet('/rooms/' + s.roomCode);
+    if (!room) { clearSession(); return false; }
+    roomCode = s.roomCode;
+    myId = s.myId;
+    myName = s.myName;
+    isHost = s.isHost;
+    // Re-add player if missing (quick refresh)
+    if (!room.players || !room.players[myId]) {
+      const playerData = { id: myId, name: myName, isHost: isHost, alive: true, role: null, word: null, ready: false };
+      await fbSet('/rooms/' + roomCode + '/players/' + myId, playerData);
+      await fbUpdate('/rooms/' + roomCode, { _v: Date.now() });
+    }
+    fbListen('/rooms/' + roomCode, (r) => { if (r) onRoomState(r); });
+    const fresh = await fbGet('/rooms/' + roomCode);
+    if (fresh) onRoomState(fresh);
+    return true;
+  } catch(e) { clearSession(); return false; }
+}
 
 // ══════════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════════
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(theme);
   renderSetupNames();
   updateSettingsLabels();
   renderHistory();
   renderPalmaros();
+  // Try to restore in-progress session after page refresh
+  const restored = await tryRestoreSession();
+  if (restored) return;
   // Check URL for room code
   const params = new URLSearchParams(window.location.search);
   const code = params.get('room');
@@ -778,8 +820,7 @@ function changeOnlineCount(key, delta) {
 // ⬇️  CONFIGUREZ VOTRE FIREBASE ICI (une seule fois, pour tous)
 // Remplacez l'URL ci-dessous par celle de votre Realtime Database
 // ══════════════════════════════════════════════════════════════
-const FIREBASE_URL = 'VOTRE_URL_FIREBASE_ICI';
-// Exemple : 'https://undercover-game-default-rtdb.europe-west1.firebasedatabase.app'
+const FIREBASE_URL = 'https://undercover-e5809-default-rtdb.europe-west1.firebasedatabase.app';
 
 // Priorité : URL codée en dur > URL sauvegardée dans les paramètres
 const FB = (FIREBASE_URL !== 'VOTRE_URL_FIREBASE_ICI'
@@ -841,7 +882,7 @@ function fbListen(path, callback) {
       const data = await fbGet(path);
       if (data === null) return;
       // Only trigger callback if data actually changed (compare _v timestamp or full hash)
-      const hash = data._v !== undefined ? String(data._v) : JSON.stringify(data).slice(0, 200);
+      const hash = data._v !== undefined ? String(data._v) + '|' + Object.keys(data.players||{}).length : JSON.stringify(data).slice(0, 400);
       if (hash !== lastHash) {
         lastHash = hash;
         callback(data);
@@ -861,7 +902,7 @@ function fbListen(path, callback) {
         const d = JSON.parse(e.data);
         const payload = (d && d.data !== undefined) ? d.data : d;
         if (!payload) return;
-        const hash = payload._v !== undefined ? String(payload._v) : JSON.stringify(payload).slice(0, 200);
+        const hash = payload._v !== undefined ? String(payload._v) + '|' + Object.keys(payload.players||{}).length : JSON.stringify(payload).slice(0, 400);
         if (hash !== lastHash) {
           lastHash = hash;
           // SSE 'put' on a sub-path only sends partial data — do a full fetch to be safe
@@ -912,8 +953,13 @@ async function connectToRoom(code, name, asHost) {
       return;
     }
   } else {
-    // Verify room exists before joining
-    const existing = await fbGet(`/rooms/${roomCode}`);
+    // Verify room exists — retry up to 3 times (network latency)
+    let existing = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      existing = await fbGet(`/rooms/${roomCode}`);
+      if (existing) break;
+      await new Promise(r => setTimeout(r, 800));
+    }
     if (!existing) {
       showSnackbar('❌ Salle introuvable. Vérifiez le code.');
       showScreen('screen-join-room');
@@ -941,6 +987,9 @@ async function connectToRoom(code, name, asHost) {
     showScreen('screen-lobby');
     document.getElementById('lobby-code').textContent = roomCode;
   }
+
+  // Save session so page refresh restores the game
+  saveSession();
 
   // Start polling for changes
   fbListen(`/rooms/${roomCode}`, (room) => {
@@ -1073,8 +1122,11 @@ async function checkVoteComplete() {
 }
 
 async function resolveVote() {
+  if (isResolvingVote) return;
+  isResolvingVote = true;
+  try {
   const room = await fbGet(`/rooms/${roomCode}`);
-  if (!room) return;
+  if (!room || (room.phase !== 'vote' && room.phase !== 'mrwhite_guess')) { isResolvingVote = false; return; }
   const votes = room.votes || {};
   const tally = {};
   Object.values(votes).forEach(id => { tally[id] = (tally[id]||0)+1; });
@@ -1090,12 +1142,13 @@ async function resolveVote() {
 
   const newRound = (room.round||1) + 1;
   if (mrWhiteElim) {
-    // Move to mrwhite_guess phase
     await fbSet(`/rooms/${roomCode}`, { ...room, players, round: newRound, phase: 'mrwhite_guess', votes:{}, voteTimerEnd:null, mrWhiteId:eliminatedId, _v:Date.now() });
   } else {
     await fbSet(`/rooms/${roomCode}`, { ...room, players, round: newRound, votes:{}, voteTimerEnd:null, _v:Date.now() });
     await checkEndConditionsOnline(players, room);
   }
+  } catch(e) { console.error('resolveVote error', e); }
+  finally { isResolvingVote = false; }
 }
 
 async function checkEndConditionsOnline(players, room) {
@@ -1148,8 +1201,9 @@ function onRoomState(room) {
       const order = room.clueOrder||[];
       const expected = order[room.clueIndex];
       if (pending.from === expected && !((room.clues||{})[pending.from])) {
-        fbUpdate(`/rooms/${roomCode}`, { [`clues/${pending.from}`]: pending.clue });
-        advanceClue(pending.from);
+        fbSet(`/rooms/${roomCode}/clues/${pending.from}`, pending.clue).then(() => {
+          advanceClue(pending.from);
+        });
       }
     }
   }
@@ -1158,7 +1212,7 @@ function onRoomState(room) {
   if (phase === 'vote' && isHost) {
     const alive = (room.players||[]).filter(p=>p.alive);
     const voted = Object.keys(room.votes||{}).length;
-    if (voted >= alive.length && voted > 0) { clearTimers(); resolveVote(); return; }
+    if (voted >= alive.length && voted > 0 && !isResolvingVote) { clearTimers(); resolveVote(); return; }
   }
 
   // Check if it's the host's turn to advance vote timer
@@ -1190,12 +1244,20 @@ function onRoomState(room) {
     return;
   }
 
+  // Host checks if all players ready (triggered by polling, not just own click)
+  if (phase === 'reveal' && isHost) {
+    const allPlayers = room.players || [];
+    const alive = allPlayers.filter(p => p.alive);
+    const ready = alive.filter(p => p.ready);
+    if (alive.length > 0 && ready.length >= alive.length) {
+      checkAllReady();
+      return;
+    }
+  }
+
   if (phase === 'lobby') {
-    const wasInGame = document.getElementById('screen-online-game').classList.contains('active') ||
-                      document.getElementById('screen-online-reveal').classList.contains('active');
     renderLobby(room);
-    if (!wasInGame) showScreen('screen-lobby');
-    else showScreen('screen-lobby'); // rematch
+    showScreen('screen-lobby');
   } else if (phase === 'reveal') {
     renderOnlineReveal(room);
     showScreen('screen-online-reveal');
@@ -1259,6 +1321,7 @@ async function leaveRoom() {
   onlineRoom = null;
   myVote = null;
   myClue = null;
+  clearSession();
   showScreen('screen-online-menu');
 }
 
@@ -1421,7 +1484,7 @@ function renderOnlinePlayers(room) {
 
 // ── CLUES PHASE ──
 function renderCluesPhase(room, isAlive, me) {
-  clearTimers();
+  clearCountdown();
   const order = room.clueOrder || [];
   const clues = room.clues || {};
   const currentIdx = room.clueIndex || 0;
@@ -1502,7 +1565,7 @@ function sendClue() {
 
 // ── DISCUSSION PHASE ──
 function renderDiscussionPhase(room) {
-  clearTimers();
+  clearCountdown();
   document.getElementById('host-start-vote').style.display = isHost ? 'block' : 'none';
 
   if (room.discussEnd) {
@@ -1514,7 +1577,7 @@ function renderDiscussionPhase(room) {
 
 // ── VOTE PHASE ──
 function renderVotePhase(room, isAlive, me) {
-  clearTimers();
+  clearCountdown();
   const votes = room.votes || {};
   const alivePlayers = (room.players||[]).filter(p => p.alive);
   const totalAlive = alivePlayers.length;
@@ -1567,9 +1630,14 @@ function onlineConfirmVote() {
 // ONLINE — TIMERS
 // ══════════════════════════════════════════════════════════════
 function clearTimers() {
-  if (voteTimer) { clearInterval(voteTimer); voteTimer = null; }
-  if (discussTimer) { clearInterval(discussTimer); discussTimer = null; }
-  if (clueTimer) { clearInterval(clueTimer); clueTimer = null; }
+  if (voteTimer) { clearTimeout(voteTimer); clearInterval(voteTimer); voteTimer = null; }
+  if (discussTimer) { clearTimeout(discussTimer); clearInterval(discussTimer); discussTimer = null; }
+  if (clueTimer) { clearTimeout(clueTimer); clearInterval(clueTimer); clueTimer = null; }
+}
+function clearCountdown() {
+  if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
+  const el = document.getElementById('online-timer-area');
+  if (el) el.innerHTML = '';
 }
 
 function startCountdown(containerId, endTimestamp, total) {
@@ -1595,11 +1663,11 @@ function startCountdown(containerId, endTimestamp, total) {
   };
 
   render();
-  const iv = setInterval(() => {
+  clearCountdown();
+  countdownInterval = setInterval(() => {
     render();
-    if (Date.now() >= endTimestamp) clearInterval(iv);
+    if (Date.now() >= endTimestamp) clearCountdown();
   }, 500);
-  voteTimer = iv;
 }
 
 // ══════════════════════════════════════════════════════════════
