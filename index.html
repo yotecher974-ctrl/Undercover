@@ -732,19 +732,25 @@ let isResolvingVote = false;
 // ══════════════════════════════════════════════════════════════
 function saveSession() {
   if (roomCode && myId) {
-    sessionStorage.setItem('uc_session', JSON.stringify({ roomCode, myId, myName, isHost }));
+    const data = JSON.stringify({ roomCode, myId, myName, isHost, ts: Date.now() });
+    sessionStorage.setItem('uc_session', data);
+    localStorage.setItem('uc_session', data); // fallback for mobile tabs
   }
 }
 function clearSession() {
   sessionStorage.removeItem('uc_session');
+  localStorage.removeItem('uc_session');
 }
 async function tryRestoreSession() {
   if (!FB) return false;
-  const raw = sessionStorage.getItem('uc_session');
+  // Try sessionStorage first, then localStorage (mobile fallback)
+  const raw = sessionStorage.getItem('uc_session') || localStorage.getItem('uc_session');
   if (!raw) return false;
   try {
     const s = JSON.parse(raw);
     if (!s.roomCode || !s.myId) return false;
+    // Expire session after 4 hours
+    if (s.ts && Date.now() - s.ts > 4 * 60 * 60 * 1000) { clearSession(); return false; }
     const room = await fbGet('/rooms/' + s.roomCode);
     if (!room) { clearSession(); return false; }
     roomCode = s.roomCode;
@@ -757,9 +763,8 @@ async function tryRestoreSession() {
       await fbSet('/rooms/' + roomCode + '/players/' + myId, playerData);
       await fbUpdate('/rooms/' + roomCode, { _v: Date.now() });
     }
+    // Start live listener — handles initial render + continuous updates
     fbListen('/rooms/' + roomCode, (r) => { if (r) onRoomState(r); });
-    const fresh = await fbGet('/rooms/' + roomCode);
-    if (fresh) onRoomState(fresh);
     return true;
   } catch(e) { clearSession(); return false; }
 }
@@ -827,13 +832,17 @@ const FB = (FIREBASE_URL !== 'VOTRE_URL_FIREBASE_ICI'
   ? FIREBASE_URL
   : (localStorage.getItem('uc_firebase_url') || '')
 ).replace(/\/$/, '');
-let fbSource = null; // EventSource for live updates
-let fbPollTimer = null;
+let fbSource = null;      // EventSource (SSE) for instant push
+let fbPollTimer = null;   // fallback polling interval
 let lastRoomEtag = null;
+let fbListenPath = null;  // currently watched path
+let fbListenCb = null;    // current callback
 
+// ── low-level helpers ─────────────────────────────────────────
 async function fbGet(path) {
   try {
     const r = await fetch(`${FB}${path}.json`);
+    if (!r.ok) return null;
     return await r.json();
   } catch { return null; }
 }
@@ -845,6 +854,7 @@ async function fbSet(path, data) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
     });
+    if (!r.ok) return null;
     return await r.json();
   } catch { return null; }
 }
@@ -856,67 +866,104 @@ async function fbUpdate(path, data) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
     });
+    if (!r.ok) return null;
     return await r.json();
   } catch { return null; }
 }
 
-async function fbTransaction(path, updateFn) {
-  // Read-modify-write with retry
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const current = await fbGet(path);
-    const updated = updateFn(current);
-    if (updated === null) return null;
-    const result = await fbSet(path, updated);
-    if (result !== null) return result;
-    await new Promise(r => setTimeout(r, 100 * (attempt + 1)));
-  }
-  return null;
+async function fbDelete(path) {
+  try {
+    await fetch(`${FB}${path}.json`, { method: 'DELETE' });
+  } catch {}
 }
 
+// ── change detection: deep hash of the full room state ────────
+function roomHash(data) {
+  // Stringify the full object so ANY field change is detected
+  try { return JSON.stringify(data); }
+  catch { return String(Date.now()); }
+}
+
+// ── real-time listener ────────────────────────────────────────
+// Strategy: SSE (Firebase EventSource) as primary, polling as fallback/safety net.
+// IMPORTANT: we NEVER skip a callback based on "already seen" — every change fires.
 function fbListen(path, callback) {
   stopListening();
+  fbListenPath = path;
+  fbListenCb = callback;
   let lastHash = null;
 
-  const poll = async () => {
+  // --- SSE (instant push from Firebase) ---
+  const startSSE = () => {
     try {
-      const data = await fbGet(path);
-      if (data === null) return;
-      // Only trigger callback if data actually changed (compare _v timestamp or full hash)
-      const hash = data._v !== undefined ? String(data._v) + '|' + Object.keys(data.players||{}).length : JSON.stringify(data).slice(0, 400);
-      if (hash !== lastHash) {
-        lastHash = hash;
-        callback(data);
-      }
-    } catch(e) {}
+      fbSource = new EventSource(`${FB}${path}.json`);
+
+      let sseDebounce = null;
+      const sseFlush = () => {
+        fbGet(path).then(full => {
+          if (!full) return;
+          const h = roomHash(full);
+          if (h !== lastHash) { lastHash = h; callback(full); }
+        });
+      };
+      const sseSchedule = () => {
+        clearTimeout(sseDebounce);
+        sseDebounce = setTimeout(sseFlush, 150); // batch rapid writes
+      };
+
+      fbSource.addEventListener('put', (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (!msg || msg.data === null) return;
+          // For root-level puts with full data, use directly (faster)
+          if (msg.path === '/' && msg.data && typeof msg.data === 'object') {
+            const h = roomHash(msg.data);
+            if (h !== lastHash) { lastHash = h; callback(msg.data); }
+          } else {
+            // Child update — fetch full room with debounce
+            sseSchedule();
+          }
+        } catch {}
+      });
+
+      fbSource.addEventListener('patch', (e) => {
+        sseSchedule(); // partial update — always re-fetch
+      });
+
+      fbSource.onerror = () => {
+        if (fbSource) { fbSource.close(); fbSource = null; }
+        // Restart SSE after a short delay
+        setTimeout(() => { if (fbListenPath && fbListenCb) startSSE(); }, 3000);
+      };
+    } catch {}
   };
 
-  // Poll immediately, then every 1.5s
-  poll();
-  fbPollTimer = setInterval(poll, 1500);
+  startSSE();
 
-  // Also try SSE for faster updates (bonus, not critical)
-  try {
-    fbSource = new EventSource(`${FB}${path}.json`);
-    fbSource.addEventListener('put', (e) => {
-      try {
-        const d = JSON.parse(e.data);
-        const payload = (d && d.data !== undefined) ? d.data : d;
-        if (!payload) return;
-        const hash = payload._v !== undefined ? String(payload._v) + '|' + Object.keys(payload.players||{}).length : JSON.stringify(payload).slice(0, 400);
-        if (hash !== lastHash) {
-          lastHash = hash;
-          // SSE 'put' on a sub-path only sends partial data — do a full fetch to be safe
-          fbGet(path).then(full => { if (full) callback(full); });
-        }
-      } catch {}
-    });
-    fbSource.onerror = () => { if (fbSource) { fbSource.close(); fbSource = null; } };
-  } catch {}
+  // --- Polling fallback (catches anything SSE misses, every 2s) ---
+  fbPollTimer = setInterval(async () => {
+    try {
+      const data = await fbGet(path);
+      if (!data) return;
+      const h = roomHash(data);
+      if (h !== lastHash) { lastHash = h; callback(data); }
+    } catch {}
+  }, 2000);
+
+  // First immediate fetch (show current state right away)
+  fbGet(path).then(data => {
+    if (!data) return;
+    const h = roomHash(data);
+    lastHash = h; // seed the hash — but DO call the callback to render
+    callback(data);
+  });
 }
 
 function stopListening() {
   if (fbSource) { fbSource.close(); fbSource = null; }
   if (fbPollTimer) { clearInterval(fbPollTimer); fbPollTimer = null; }
+  fbListenPath = null;
+  fbListenCb = null;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -979,19 +1026,11 @@ async function connectToRoom(code, name, asHost) {
   await fbSet(`/rooms/${roomCode}/players/${myId}`, playerData);
   await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() });
 
-  // Fetch current state and show lobby immediately (don't wait for first poll)
-  const currentRoom = await fbGet(`/rooms/${roomCode}`);
-  if (currentRoom) {
-    onRoomState(currentRoom);
-  } else {
-    showScreen('screen-lobby');
-    document.getElementById('lobby-code').textContent = roomCode;
-  }
-
-  // Save session so page refresh restores the game
+  // Save session so page refresh can restore the game
   saveSession();
 
-  // Start polling for changes
+  // Start live listener — it does an immediate fetch+render internally,
+  // then keeps watching for any changes (SSE + polling fallback).
   fbListen(`/rooms/${roomCode}`, (room) => {
     if (room) onRoomState(room);
   });
@@ -1257,7 +1296,8 @@ function onRoomState(room) {
 
   if (phase === 'lobby') {
     renderLobby(room);
-    showScreen('screen-lobby');
+    const curScreen = document.querySelector('.screen.active');
+    if (!curScreen || curScreen.id !== 'screen-lobby') showScreen('screen-lobby');
   } else if (phase === 'reveal') {
     renderOnlineReveal(room);
     showScreen('screen-online-reveal');
@@ -1306,10 +1346,12 @@ async function leaveRoom() {
   if (roomCode && myId) {
     // Remove ourselves from the room
     try {
-      await fetch(`${FB}/rooms/${roomCode}/players/${myId}.json`, { method: 'DELETE' });
+      await fbDelete(`/rooms/${roomCode}/players/${myId}`);
+      // Bump _v so remaining players see the leave
+      await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() });
       // If host leaves and game hasn't started, delete entire room
       if (isHost && onlineRoom && onlineRoom.phase === 'lobby') {
-        await fetch(`${FB}/rooms/${roomCode}.json`, { method: 'DELETE' });
+        await fbDelete(`/rooms/${roomCode}`);
       }
     } catch(e) {}
   }
@@ -2153,7 +2195,7 @@ async function cleanupStaleRooms() {
       if (code === roomCode) continue;
       const age = now - (room._v || 0);
       if (age > 2 * 60 * 60 * 1000) { // 2h
-        await fetch(`${FB}/rooms/${code}.json`, { method: 'DELETE' });
+        await fbDelete(`/rooms/${code}`);
       }
     }
   } catch(e) {}
