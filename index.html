@@ -1,3 +1,20 @@
+Aucun élément sélectionné
+
+Aller au contenu
+Utiliser Gmail avec un lecteur d'écran
+Activez les notifications sur le bureau pour Gmail.
+   OK  Non, merci
+1 sur 1 737
+(aucun objet)
+Boîte de réception
+
+Yohan Techer <yohan.tchr@gmail.com>
+Pièces jointes
+14:16 (il y a 0 minute)
+À moi
+
+ Une pièce jointe
+  •  Analysé par Gmail
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -323,6 +340,10 @@
     <div style="text-align:center; padding:24px 0 32px;">
       <span style="font-size:56px;">🌐</span>
       <p style="color:var(--muted); margin-top:12px; font-size:14px; line-height:1.7;">Chaque joueur utilise son propre appareil.<br>Créez une salle ou rejoignez-en une avec un code.</p>
+    </div>
+    <div id="firebase-warning" style="display:none;" class="alert alert-warning">
+      ⚠️ Firebase non configuré — le mode Online ne fonctionnera pas.<br>
+      <a onclick="showScreen('screen-settings')" style="color:var(--gold);cursor:pointer;text-decoration:underline;">→ Aller dans Paramètres pour configurer</a>
     </div>
     <div style="display:flex; flex-direction:column; gap:12px;">
       <button class="btn btn-online btn-lg" onclick="showScreen('screen-create-room')">✨ Créer une partie</button>
@@ -660,12 +681,13 @@
     <div class="section-title">Configuration Online</div>
     <div class="card">
       <p style="font-size:13px;color:var(--muted);line-height:1.5;margin-bottom:10px;">
-        Le mode Online nécessite Firebase Realtime Database (gratuit).<br>
-        <a href="https://console.firebase.google.com" target="_blank" style="color:var(--accent);">→ Créer un projet Firebase</a>
+        Normalement l'URL Firebase est <strong style="color:var(--text);">déjà configurée dans le fichier</strong> par le développeur — les joueurs n'ont rien à faire.<br><br>
+        Si tu héberges toi-même et que tu n'as pas modifié le code, entre ton URL ici :<br>
+        <a href="https://console.firebase.google.com" target="_blank" style="color:var(--accent);">→ Créer un projet Firebase gratuit</a>
       </p>
-      <div class="input-label">URL de votre base Firebase</div>
-      <input type="text" id="firebase-url-input" placeholder="https://votre-projet-rtdb.europe-west1.firebasedatabase.app" style="font-size:12px; margin-bottom:10px;" oninput="this.value=this.value.trim()">
-      <button class="btn btn-secondary btn-sm" onclick="saveFirebaseUrl()" style="width:auto;">💾 Sauvegarder</button>
+      <div class="input-label">URL Firebase (override local)</div>
+      <input type="text" id="firebase-url-input" placeholder="https://mon-projet-rtdb.europe-west1.firebasedatabase.app" style="font-size:12px; margin-bottom:10px;" oninput="this.value=this.value.trim()">
+      <button class="btn btn-secondary btn-sm" onclick="saveFirebaseUrl()" style="width:auto;">💾 Sauvegarder sur cet appareil</button>
     </div>
 
     <div class="section-title">À propos</div>
@@ -747,6 +769,10 @@ function showScreen(id) {
   window.scrollTo(0,0);
   if (id==='screen-history') { renderHistory(); renderPalmaros(); }
   if (id==='screen-settings') updateSettingsLabels();
+  if (id==='screen-online-menu') {
+    const warn = document.getElementById('firebase-warning');
+    if (warn) warn.style.display = FB ? 'none' : 'block';
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -765,10 +791,18 @@ function changeOnlineCount(key, delta) {
 // ONLINE ENGINE — Firebase Realtime Database (REST + SSE)
 // No server deployment needed. Free tier, works from any HTML file.
 // ══════════════════════════════════════════════════════════════
-// ⬇️ REMPLACEZ par votre URL Firebase Realtime Database
-// Créez un projet gratuit sur console.firebase.google.com
-const FB_URL = localStorage.getItem('uc_firebase_url') || 'https://undercover-rtdb-default-rtdb.europe-west1.firebasedatabase.app';
-const FB = FB_URL.replace(/\/$/, '');
+// ══════════════════════════════════════════════════════════════
+// ⬇️  CONFIGUREZ VOTRE FIREBASE ICI (une seule fois, pour tous)
+// Remplacez l'URL ci-dessous par celle de votre Realtime Database
+// ══════════════════════════════════════════════════════════════
+const FIREBASE_URL = 'VOTRE_URL_FIREBASE_ICI';
+// Exemple : 'https://undercover-game-default-rtdb.europe-west1.firebasedatabase.app'
+
+// Priorité : URL codée en dur > URL sauvegardée dans les paramètres
+const FB = (FIREBASE_URL !== 'VOTRE_URL_FIREBASE_ICI'
+  ? FIREBASE_URL
+  : (localStorage.getItem('uc_firebase_url') || '')
+).replace(/\/$/, '');
 let fbSource = null; // EventSource for live updates
 let fbPollTimer = null;
 let lastRoomEtag = null;
@@ -817,30 +851,43 @@ async function fbTransaction(path, updateFn) {
 
 function fbListen(path, callback) {
   stopListening();
-  // Use EventSource (SSE) for real-time updates
+  let lastHash = null;
+
+  const poll = async () => {
+    try {
+      const data = await fbGet(path);
+      if (data === null) return;
+      // Only trigger callback if data actually changed (compare _v timestamp or full hash)
+      const hash = data._v !== undefined ? String(data._v) : JSON.stringify(data).slice(0, 200);
+      if (hash !== lastHash) {
+        lastHash = hash;
+        callback(data);
+      }
+    } catch(e) {}
+  };
+
+  // Poll immediately, then every 1.5s
+  poll();
+  fbPollTimer = setInterval(poll, 1500);
+
+  // Also try SSE for faster updates (bonus, not critical)
   try {
     fbSource = new EventSource(`${FB}${path}.json`);
     fbSource.addEventListener('put', (e) => {
       try {
         const d = JSON.parse(e.data);
-        if (d && d.data !== undefined) callback(d.data);
-        else if (d) callback(d);
+        const payload = (d && d.data !== undefined) ? d.data : d;
+        if (!payload) return;
+        const hash = payload._v !== undefined ? String(payload._v) : JSON.stringify(payload).slice(0, 200);
+        if (hash !== lastHash) {
+          lastHash = hash;
+          // SSE 'put' on a sub-path only sends partial data — do a full fetch to be safe
+          fbGet(path).then(full => { if (full) callback(full); });
+        }
       } catch {}
     });
-    fbSource.onerror = () => {
-      // Fallback to polling if SSE fails
-      stopListening();
-      fbPollTimer = setInterval(async () => {
-        const data = await fbGet(path);
-        if (data) callback(data);
-      }, 1500);
-    };
-  } catch {
-    fbPollTimer = setInterval(async () => {
-      const data = await fbGet(path);
-      if (data) callback(data);
-    }, 1500);
-  }
+    fbSource.onerror = () => { if (fbSource) { fbSource.close(); fbSource = null; } };
+  } catch {}
 }
 
 function stopListening() {
@@ -877,16 +924,42 @@ async function connectToRoom(code, name, asHost) {
     };
     const ok = await fbSet(`/rooms/${roomCode}`, room);
     if (!ok && ok !== false) {
-      showSnackbar('Erreur de connexion. Vérifiez votre réseau.');
+      showSnackbar('❌ Erreur de connexion. Vérifiez votre URL Firebase dans Paramètres.');
+      showScreen('screen-online-menu');
+      return;
+    }
+  } else {
+    // Verify room exists before joining
+    const existing = await fbGet(`/rooms/${roomCode}`);
+    if (!existing) {
+      showSnackbar('❌ Salle introuvable. Vérifiez le code.');
+      showScreen('screen-join-room');
+      roomCode = null; myName = null; myId = null;
+      return;
+    }
+    if (existing.phase && existing.phase !== 'lobby') {
+      showSnackbar('⚠️ La partie a déjà commencé.');
+      showScreen('screen-join-room');
+      roomCode = null; myName = null; myId = null;
       return;
     }
   }
 
-  // Join: add self to players
+  // Add self to players (and bump _v so all listeners detect the change)
   const playerData = { id: myId, name, isHost: asHost, alive: true, role: null, word: null, ready: false };
   await fbSet(`/rooms/${roomCode}/players/${myId}`, playerData);
+  await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() });
 
-  // Start listening
+  // Fetch current state and show lobby immediately (don't wait for first poll)
+  const currentRoom = await fbGet(`/rooms/${roomCode}`);
+  if (currentRoom) {
+    onRoomState(currentRoom);
+  } else {
+    showScreen('screen-lobby');
+    document.getElementById('lobby-code').textContent = roomCode;
+  }
+
+  // Start polling for changes
   fbListen(`/rooms/${roomCode}`, (room) => {
     if (room) onRoomState(room);
   });
@@ -1162,23 +1235,24 @@ function showMrWhiteModalOnline(player) {
 // ══════════════════════════════════════════════════════════════
 // ONLINE — CREATE / JOIN
 // ══════════════════════════════════════════════════════════════
-function createRoom() {
+async function createRoom() {
   const name = document.getElementById('host-name-input').value.trim();
   if (!name) { showSnackbar('Entrez votre pseudo'); return; }
   const code = generateCode();
-  connectToRoom(code, name, true);
-  showScreen('screen-lobby');
-  document.getElementById('lobby-code').textContent = code;
+  // Show a loading state
+  showSnackbar('⏳ Création de la salle...');
+  await connectToRoom(code, name, true);
+  // connectToRoom handles showScreen internally now
 }
 
-function joinRoom() {
+async function joinRoom() {
   const name = document.getElementById('join-name-input').value.trim();
   const code = document.getElementById('join-code-input').value.trim().toUpperCase();
   if (!name) { showSnackbar('Entrez votre pseudo'); return; }
   if (code.length !== 6) { showSnackbar('Le code doit faire 6 caractères'); return; }
-  connectToRoom(code, name, false);
-  showScreen('screen-lobby');
-  document.getElementById('lobby-code').textContent = code;
+  showSnackbar('⏳ Connexion à la salle...');
+  await connectToRoom(code, name, false);
+  // connectToRoom handles showScreen and errors internally
 }
 
 async function leaveRoom() {
@@ -2006,7 +2080,7 @@ function saveFirebaseUrl() {
     return;
   }
   localStorage.setItem('uc_firebase_url', url);
-  showSnackbar('✅ URL Firebase sauvegardée ! Rechargez la page.');
+  showSnackbar('✅ URL sauvegardée sur cet appareil. Rechargez la page.');
 }
 function loadFirebaseUrl() {
   const saved = localStorage.getItem('uc_firebase_url') || '';
@@ -2039,3 +2113,5 @@ setTimeout(() => { if (isHost && roomCode) cleanupStaleRooms(); }, 30000);
 </script>
 </body>
 </html>
+index-2.html
+Affichage de index-2.html en cours...
