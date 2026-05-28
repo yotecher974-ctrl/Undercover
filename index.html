@@ -1096,10 +1096,22 @@ async function checkAllReady() {
 async function hostDoStartClues(room) {
   if (!room) room = await fbGet(`/rooms/${roomCode}`);
   if (!room) return;
-  const alive = Object.values(room.players||{}).filter(p=>p.alive);
+
+  const alive = Object.values(room.players || {}).filter(p => p.alive);
+
   const order = shuffle(alive.map(p => p.id));
+
+  // IMPORTANT :
+  // On reset les indices UNIQUEMENT
+  // au début d'une NOUVELLE MANCHE.
+
   await fbUpdate(`/rooms/${roomCode}`, {
-    phase: 'clues', clueOrder: order, clueIndex: 0, clues: {}, _v: Date.now() + (Math.random() * 999 | 0)
+    phase: 'clues',
+    clueOrder: order,
+    clueIndex: 0,
+    clues: {},
+    pendingClue: null,
+    _v: Date.now() + (Math.random() * 999 | 0)
   });
 }
 
@@ -1206,36 +1218,54 @@ async function hostDoRematch() {
 // ══════════════════════════════════════════════════════════════
 // ONLINE — SERVER MESSAGES
 // ══════════════════════════════════════════════════════════════
-function onRoomState(room) {
+async function onRoomState(room) { 
   // Normalize players object to array
   if (room.players && !Array.isArray(room.players)) {
     room = { ...room, players: Object.values(room.players) };
   }
+
   onlineRoom = room;
   const phase = room.phase;
 
   // Handle non-host watching for pendingClue to advance
   if (phase === 'clues' && isHost) {
     const pending = room.pendingClue;
+
     if (pending && pending.from) {
-      const order = room.clueOrder||[];
+      const order = room.clueOrder || [];
       const expected = order[room.clueIndex];
-      if (pending.from === expected && !((room.clues||{})[pending.from])) {
-        fbSet(`/rooms/${roomCode}/clues/${pending.from}`, pending.clue).then(() => {
-          advanceClue(pending.from);
+
+      // On accepte uniquement le joueur attendu
+      if (
+        pending.from === expected &&
+        !((room.clues || {})[pending.from])
+      ) {
+        // Sauvegarde immédiate de l'indice
+        await fbUpdate(`/rooms/${roomCode}`, {
+          [`clues/${pending.from}`]: pending.clue,
+          pendingClue: null,
+          _v: Date.now() + (Math.random() * 999 | 0)
         });
+
+        // Puis passage au joueur suivant
+        await advanceClue(pending.from);
       }
     }
   }
 
   // Check if all players voted (host resolves)
   if (phase === 'vote' && isHost) {
-    const alive = (room.players||[]).filter(p=>p.alive);
-    const voted = Object.keys(room.votes||{}).length;
-    if (voted >= alive.length && voted > 0 && !isResolvingVote) { clearTimers(); resolveVote(); return; }
+    const alive = (room.players || []).filter(p => p.alive);
+    const voted = Object.keys(room.votes || {}).length;
+
+    if (voted >= alive.length && voted > 0 && !isResolvingVote) {
+      clearTimers();
+      resolveVote();
+      return;
+    }
   }
 
-  // Check if it's the host's turn to advance vote timer
+  // Check vote timer
   if (phase === 'vote' && isHost && room.voteTimerEnd && !voteTimer) {
     const remaining = room.voteTimerEnd - Date.now();
     if (remaining > 0) {
@@ -1244,6 +1274,8 @@ function onRoomState(room) {
       resolveVote();
     }
   }
+
+  // Check discussion timer
   if (phase === 'discussion' && isHost && room.discussEnd && !discussTimer) {
     const remaining = room.discussEnd - Date.now();
     if (remaining > 0) {
@@ -1255,7 +1287,8 @@ function onRoomState(room) {
 
   // Handle Mr White guess
   if (phase === 'mrwhite_guess') {
-    const mrwPlayer = room.players.find(p => p.id === room.mrWhiteId);
+    const mrwPlayer = (room.players || []).find(p => p.id === room.mrWhiteId);
+
     if (mrwPlayer && mrwPlayer.id === myId) {
       showMrWhiteModalOnline(mrwPlayer);
     } else {
@@ -1264,32 +1297,41 @@ function onRoomState(room) {
     return;
   }
 
-  // Host checks if all players ready (triggered by polling, not just own click)
+  // Host checks if all players ready
   if (phase === 'reveal' && isHost) {
     const allPlayers = room.players || [];
     const alive = allPlayers.filter(p => p.alive);
     const ready = alive.filter(p => p.ready);
+
     if (alive.length > 0 && ready.length >= alive.length) {
       checkAllReady();
       return;
     }
   }
 
+  // Rendering
   if (phase === 'lobby') {
     renderLobby(room);
     const curScreen = document.querySelector('.screen.active');
     if (!curScreen || curScreen.id !== 'screen-lobby') showScreen('screen-lobby');
+
   } else if (phase === 'reveal') {
     renderOnlineReveal(room);
     showScreen('screen-online-reveal');
-  } else if (phase === 'clues' || phase === 'discussion' || phase === 'vote' || phase === 'mrwhite_guess') {
+
+  } else if (
+    phase === 'clues' ||
+    phase === 'discussion' ||
+    phase === 'vote' ||
+    phase === 'mrwhite_guess'
+  ) {
     renderOnlineGame(room);
     showScreen('screen-online-game');
+
   } else if (phase === 'end') {
     renderOnlineEnd(room);
   }
 }
-
 function showMrWhiteModalOnline(player) {
   document.getElementById('mrWhitePlayerName').textContent = `${player.name} est M. White !`;
   document.getElementById('mrWhiteGuessInput').value = '';
@@ -1531,57 +1573,95 @@ function renderOnlinePlayers(room) {
 // ── CLUES PHASE ──
 function renderCluesPhase(room, isAlive, me) {
   clearCountdown();
+
   const order = room.clueOrder || [];
   const clues = room.clues || {};
   const currentIdx = room.clueIndex || 0;
   const currentPlayerId = order[currentIdx];
   const isMyTurn = currentPlayerId === myId;
 
-  // Messages
+  // ─────────────────────────────
+  // AFFICHAGE DES INDICES
+  // ─────────────────────────────
   const msgArea = document.getElementById('clues-messages');
   msgArea.innerHTML = '';
-  order.slice(0, currentIdx).forEach(pid => {
-    const player = (room.players||[]).find(p => p.id === pid);
+
+  // IMPORTANT :
+  // On affiche TOUS les indices déjà envoyés,
+  // pas seulement ceux avant currentIdx.
+  order.forEach(pid => {
+    const player = (room.players || []).find(p => p.id === pid);
     const clue = clues[pid];
+
     if (!player || !clue) return;
+
     const isMine = pid === myId;
+
     const div = document.createElement('div');
-    div.className = `message-bubble ${isMine?'mine':'other'}`;
-    div.innerHTML = `<div class="msg-author" style="color:${isMine?'var(--accent)':'var(--muted)'};">${player.name}</div><div class="msg-text">${clue}</div>`;
+    div.className = `message-bubble ${isMine ? 'mine' : 'other'}`;
+
+    div.innerHTML = `
+      <div class="msg-author" style="color:${isMine ? 'var(--accent)' : 'var(--muted)'};">
+        ${player.name}
+      </div>
+      <div class="msg-text">${clue}</div>
+    `;
+
     msgArea.appendChild(div);
   });
+
   msgArea.scrollTop = msgArea.scrollHeight;
 
-  // Turn indicator
+  // ─────────────────────────────
+  // TOUR ACTUEL
+  // ─────────────────────────────
   const indicator = document.getElementById('msg-turn-indicator');
+
   if (currentIdx < order.length) {
-    const cp = (room.players||[]).find(p => p.id === currentPlayerId);
+    const cp = (room.players || []).find(p => p.id === currentPlayerId);
+
     indicator.style.display = 'block';
-    indicator.textContent = isMyTurn ? '✍️ C\'est votre tour — donnez votre indice !' : `⏳ ${cp?.name||'?'} est en train d\'écrire...`;
-    indicator.style.color = isMyTurn ? 'var(--accent)' : 'var(--text)';
+
+    indicator.textContent = isMyTurn
+      ? '✍️ C\'est votre tour — donnez votre indice !'
+      : `⏳ ${cp?.name || '?'} est en train d'écrire...`;
+
+    indicator.style.color = isMyTurn
+      ? 'var(--accent)'
+      : 'var(--text)';
   } else {
     indicator.style.display = 'none';
   }
 
-  // Input
+  // ─────────────────────────────
+  // INPUT
+  // ─────────────────────────────
   const inputArea = document.getElementById('clue-input-area');
   const sentMsg = document.getElementById('clue-sent-msg');
+
   if (isMyTurn && isAlive && !clues[myId]) {
     inputArea.style.display = 'block';
     sentMsg.style.display = 'none';
-    setTimeout(() => document.getElementById('clue-input')?.focus(), 100);
+
+    setTimeout(() => {
+      document.getElementById('clue-input')?.focus();
+    }, 100);
+
   } else if (clues[myId]) {
     inputArea.style.display = 'none';
     sentMsg.style.display = 'block';
+
   } else {
     inputArea.style.display = 'none';
     sentMsg.style.display = 'none';
   }
 
   // Host skip
-  document.getElementById('host-skip-clues').style.display = isHost ? 'block' : 'none';
+  document.getElementById('host-skip-clues').style.display = isHost
+    ? 'block'
+    : 'none';
 
-  // Timer if present
+  // Timer
   if (room.clueTimerEnd) {
     startCountdown('online-timer-area', room.clueTimerEnd, 30);
   }
