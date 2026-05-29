@@ -476,10 +476,14 @@
   <!-- Players list -->
   <div class="players-game-list" id="online-players-list"></div>
 
+  <!-- Indices visibles pendant toutes les phases (clues, discussion, vote) -->
+  <div id="clues-messages-wrapper" style="display:none;">
+    <div class="messages-area" id="clues-messages" style="max-height:220px;"></div>
+  </div>
+
   <!-- PHASE: CLUES -->
   <div id="phase-clues" style="display:none;">
     <div id="msg-turn-indicator" class="msg-turn-indicator" style="display:none;"></div>
-    <div class="messages-area" id="clues-messages"></div>
     <div id="clue-input-area" style="padding:16px 24px; display:none;">
       <div style="display:flex; gap:8px;">
         <input type="text" id="clue-input" placeholder="Max 3 mots, 25 caractères..." maxlength="25" style="flex:1;" oninput="validateClueInput(this)">
@@ -1002,6 +1006,15 @@ async function connectToRoom(code, name, asHost) {
   // Save session so page refresh can restore the game
   saveSession();
 
+  // For joiners: show lobby immediately so they don't stare at a blank screen
+  // onRoomState will keep the UI in sync as soon as the first poll returns
+  if (!asHost) {
+    showScreen('screen-lobby');
+    document.getElementById('lobby-code').textContent = roomCode;
+    document.getElementById('lobby-waiting-msg').style.display = 'block';
+    document.getElementById('lobby-host-actions').style.display = 'none';
+  }
+
   // Start live listener — it does an immediate fetch+render internally,
   // then keeps watching for any changes (SSE + polling fallback).
   fbListen(`/rooms/${roomCode}`, (room) => {
@@ -1027,11 +1040,19 @@ async function send(action) {
     if (isHost) await checkAllReady();
   }
   else if (action.type === 'send_clue') {
-    await fbUpdate(`/rooms/${roomCode}/clues`, { [myId]: action.clue });
-    if (isHost) await advanceClue(myId);
-    else {
-      // Signal host to advance
-      await fbUpdate(`/rooms/${roomCode}/pendingClue`, { from: myId, clue: action.clue, ts: Date.now() });
+    if (isHost) {
+      // L'hôte écrit directement dans clues et avance
+      await fbUpdate(`/rooms/${roomCode}`, {
+        [`clues/${myId}`]: action.clue,
+        _v: Date.now() + (Math.random() * 999 | 0)
+      });
+      await advanceClue(myId);
+    } else {
+      // Le non-hôte signale via pendingClue uniquement (l'hôte écrira dans clues)
+      await fbUpdate(`/rooms/${roomCode}`, {
+        pendingClue: { from: myId, clue: action.clue, ts: Date.now() },
+        _v: Date.now() + (Math.random() * 999 | 0)
+      });
     }
   }
   else if (action.type === 'vote') {
@@ -1077,7 +1098,7 @@ async function hostDoStartGame() {
     innocentWord: pair[0],
     impostorWord: pair[1],
     round: 1,
-    clues: {}, votes: {},
+    clues: {}, allClues: {}, votes: {},
     clueOrder: [], clueIndex: 0,
     winner: null, voteTimerEnd: null, discussEnd: null,
     _v: Date.now() + (Math.random() * 999 | 0)
@@ -1112,6 +1133,7 @@ async function hostDoStartClues(room) {
     clues: {},
     pendingClue: null,
     _v: Date.now() + (Math.random() * 999 | 0)
+    // allClues is intentionally preserved across rounds
   });
 }
 
@@ -1123,6 +1145,11 @@ async function advanceClue(fromId) {
   if (currentExpected !== fromId) return;
   const newIndex = room.clueIndex + 1;
   if (newIndex >= order.length) {
+    // Merge current clues into allClues before moving to discussion
+    const existingAllClues = room.allClues || {};
+    const currentClues = room.clues || {};
+    const merged = { ...existingAllClues, ...currentClues };
+    await fbUpdate(`/rooms/${roomCode}`, { allClues: merged, _v: Date.now() + (Math.random() * 999 | 0) });
     await hostDoStartDiscussion();
   } else {
     await fbUpdate(`/rooms/${roomCode}`, { clueIndex: newIndex, _v: Date.now() + (Math.random() * 999 | 0) });
@@ -1212,18 +1239,17 @@ async function hostDoRematch() {
   Object.entries(room.players||{}).forEach(([id,p]) => {
     players[id] = { ...p, alive:true, role:null, word:null, ready:false };
   });
-  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, votes:{}, clueOrder:[], clueIndex:0, round:0, _v: Date.now() + (Math.random() * 999 | 0) });
+  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, allClues:{}, votes:{}, clueOrder:[], clueIndex:0, round:0, _v: Date.now() + (Math.random() * 999 | 0) });
 }
 
 // ══════════════════════════════════════════════════════════════
 // ONLINE — SERVER MESSAGES
 // ══════════════════════════════════════════════════════════════
-async function onRoomState(room) { 
+async function onRoomState(room) {
   // Normalize players object to array
   if (room.players && !Array.isArray(room.players)) {
     room = { ...room, players: Object.values(room.players) };
   }
-
   onlineRoom = room;
   const phase = room.phase;
 
@@ -1240,14 +1266,12 @@ async function onRoomState(room) {
         pending.from === expected &&
         !((room.clues || {})[pending.from])
       ) {
-        // Sauvegarde immédiate de l'indice
+        // Sauvegarde immédiate de l'indice + effacement pendingClue + avance
         await fbUpdate(`/rooms/${roomCode}`, {
           [`clues/${pending.from}`]: pending.clue,
           pendingClue: null,
           _v: Date.now() + (Math.random() * 999 | 0)
         });
-
-        // Puis passage au joueur suivant
         await advanceClue(pending.from);
       }
     }
@@ -1255,17 +1279,12 @@ async function onRoomState(room) {
 
   // Check if all players voted (host resolves)
   if (phase === 'vote' && isHost) {
-    const alive = (room.players || []).filter(p => p.alive);
-    const voted = Object.keys(room.votes || {}).length;
-
-    if (voted >= alive.length && voted > 0 && !isResolvingVote) {
-      clearTimers();
-      resolveVote();
-      return;
-    }
+    const alive = (room.players||[]).filter(p=>p.alive);
+    const voted = Object.keys(room.votes||{}).length;
+    if (voted >= alive.length && voted > 0 && !isResolvingVote) { clearTimers(); resolveVote(); return; }
   }
 
-  // Check vote timer
+  // Check if it's the host's turn to advance vote timer
   if (phase === 'vote' && isHost && room.voteTimerEnd && !voteTimer) {
     const remaining = room.voteTimerEnd - Date.now();
     if (remaining > 0) {
@@ -1274,8 +1293,6 @@ async function onRoomState(room) {
       resolveVote();
     }
   }
-
-  // Check discussion timer
   if (phase === 'discussion' && isHost && room.discussEnd && !discussTimer) {
     const remaining = room.discussEnd - Date.now();
     if (remaining > 0) {
@@ -1287,8 +1304,7 @@ async function onRoomState(room) {
 
   // Handle Mr White guess
   if (phase === 'mrwhite_guess') {
-    const mrwPlayer = (room.players || []).find(p => p.id === room.mrWhiteId);
-
+    const mrwPlayer = room.players.find(p => p.id === room.mrWhiteId);
     if (mrwPlayer && mrwPlayer.id === myId) {
       showMrWhiteModalOnline(mrwPlayer);
     } else {
@@ -1297,41 +1313,32 @@ async function onRoomState(room) {
     return;
   }
 
-  // Host checks if all players ready
+  // Host checks if all players ready (triggered by polling, not just own click)
   if (phase === 'reveal' && isHost) {
     const allPlayers = room.players || [];
     const alive = allPlayers.filter(p => p.alive);
     const ready = alive.filter(p => p.ready);
-
     if (alive.length > 0 && ready.length >= alive.length) {
       checkAllReady();
       return;
     }
   }
 
-  // Rendering
   if (phase === 'lobby') {
     renderLobby(room);
     const curScreen = document.querySelector('.screen.active');
     if (!curScreen || curScreen.id !== 'screen-lobby') showScreen('screen-lobby');
-
   } else if (phase === 'reveal') {
     renderOnlineReveal(room);
     showScreen('screen-online-reveal');
-
-  } else if (
-    phase === 'clues' ||
-    phase === 'discussion' ||
-    phase === 'vote' ||
-    phase === 'mrwhite_guess'
-  ) {
+  } else if (phase === 'clues' || phase === 'discussion' || phase === 'vote' || phase === 'mrwhite_guess') {
     renderOnlineGame(room);
     showScreen('screen-online-game');
-
   } else if (phase === 'end') {
     renderOnlineEnd(room);
   }
 }
+
 function showMrWhiteModalOnline(player) {
   document.getElementById('mrWhitePlayerName').textContent = `${player.name} est M. White !`;
   document.getElementById('mrWhiteGuessInput').value = '';
@@ -1549,6 +1556,12 @@ function renderOnlineGame(room) {
   document.getElementById('phase-discussion').style.display = phase==='discussion' ? 'block' : 'none';
   document.getElementById('phase-vote').style.display = phase==='vote' ? 'block' : 'none';
 
+  // Le wrapper des indices est visible dès qu'il y a des indices (toutes phases)
+  const allCluesMerged = { ...(room.allClues || {}), ...(room.clues || {}) };
+  const hasClues = Object.keys(allCluesMerged).length > 0;
+  const wrapper = document.getElementById('clues-messages-wrapper');
+  if (wrapper) wrapper.style.display = hasClues ? 'block' : 'none';
+
   if (phase==='clues') renderCluesPhase(room, isAlive, me);
   if (phase==='discussion') renderDiscussionPhase(room);
   if (phase==='vote') renderVotePhase(room, isAlive, me);
@@ -1585,12 +1598,31 @@ function renderCluesPhase(room, isAlive, me) {
   // ─────────────────────────────
   const msgArea = document.getElementById('clues-messages');
   msgArea.innerHTML = '';
+  const allPlayers = room.players || [];
 
-  // IMPORTANT :
-  // On affiche TOUS les indices déjà envoyés,
-  // pas seulement ceux avant currentIdx.
+  // Afficher les indices des manches précédentes (allClues) en grisé
+  const allClues = room.allClues || {};
+  const prevClueIds = Object.keys(allClues);
+  if (prevClueIds.length > 0) {
+    const prevDiv = document.createElement('div');
+    prevDiv.style.cssText = 'opacity:0.55; margin-bottom:8px; padding-bottom:8px; border-bottom:1px solid var(--border);';
+    prevDiv.innerHTML = '<div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);text-align:center;margin-bottom:6px;">Indices des manches précédentes</div>';
+    prevClueIds.forEach(pid => {
+      const player = allPlayers.find(p => p.id === pid);
+      const clue = allClues[pid];
+      if (!player || !clue) return;
+      const isMine = pid === myId;
+      const d = document.createElement('div');
+      d.className = 'message-bubble ' + (isMine ? 'mine' : 'other');
+      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + clue + '</div>';
+      prevDiv.appendChild(d);
+    });
+    msgArea.appendChild(prevDiv);
+  }
+
+  // Afficher les indices de la manche en cours
   order.forEach(pid => {
-    const player = (room.players || []).find(p => p.id === pid);
+    const player = allPlayers.find(p => p.id === pid);
     const clue = clues[pid];
 
     if (!player || !clue) return;
@@ -1699,11 +1731,30 @@ function renderDiscussionPhase(room) {
   } else {
     document.getElementById('online-timer-area').innerHTML = '';
   }
+
 }
 
 // ── VOTE PHASE ──
 function renderVotePhase(room, isAlive, me) {
   clearCountdown();
+  // Rafraîchir l'affichage des indices (tous les joueurs peuvent les voir)
+  const allCluesToShow = { ...(room.allClues || {}), ...(room.clues || {}) };
+  const clueIdsToShow = Object.keys(allCluesToShow);
+  const msgArea = document.getElementById('clues-messages');
+  if (msgArea && clueIdsToShow.length > 0) {
+    msgArea.innerHTML = '<div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);text-align:center;margin-bottom:8px;">Indices donnés</div>';
+    clueIdsToShow.forEach(pid => {
+      const player = (room.players || []).find(p => p.id === pid);
+      const clue = allCluesToShow[pid];
+      if (!player || !clue) return;
+      const isMine = pid === myId;
+      const d = document.createElement('div');
+      d.className = 'message-bubble ' + (isMine ? 'mine' : 'other');
+      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + clue + '</div>';
+      msgArea.appendChild(d);
+    });
+    msgArea.scrollTop = msgArea.scrollHeight;
+  }
   const votes = room.votes || {};
   const alivePlayers = (room.players||[]).filter(p => p.alive);
   const totalAlive = alivePlayers.length;
