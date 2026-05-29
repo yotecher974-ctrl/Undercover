@@ -251,6 +251,19 @@
 <body>
 <div class="snackbar" id="snackbar"></div>
 
+<!-- KICK PLAYER MODAL -->
+<div id="kick-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:600; align-items:center; justify-content:center; padding:24px;">
+  <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:32px 24px; max-width:340px; width:100%; text-align:center;">
+    <div style="font-size:40px; margin-bottom:12px;">🚫</div>
+    <h2 style="font-family:'Bebas Neue',sans-serif; font-size:26px; letter-spacing:2px; margin-bottom:8px; color:var(--red);">EXPULSER</h2>
+    <p id="kick-modal-text" style="color:var(--muted); font-size:14px; margin-bottom:24px; line-height:1.5;"></p>
+    <div style="display:flex; gap:12px;">
+      <button class="btn btn-ghost" style="flex:1;" onclick="closeKickModal()">Annuler</button>
+      <button class="btn btn-danger" style="flex:1;" onclick="executeKick()">Expulser</button>
+    </div>
+  </div>
+</div>
+
 <!-- MR WHITE MODAL -->
 <div id="mrWhiteModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:500; display:none; align-items:center; justify-content:center; padding:24px;">
   <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:32px 24px; max-width:360px; width:100%; text-align:center;">
@@ -998,6 +1011,17 @@ async function connectToRoom(code, name, asHost) {
     }
   }
 
+  // Anti-dédoublonnage : si un joueur avec le même nom est déjà présent,
+  // réutiliser son ID plutôt que d'en créer un nouveau.
+  const existingRoom = await fbGet(`/rooms/${roomCode}`);
+  const existingPlayers = existingRoom?.players || {};
+  const duplicate = Object.values(existingPlayers).find(
+    p => p.name === name && p.isHost === asHost
+  );
+  if (duplicate) {
+    myId = duplicate.id;
+  }
+
   // Add self to players (and bump _v so all listeners detect the change)
   const playerData = { id: myId, name, isHost: asHost, alive: true, role: null, word: null, ready: false };
   await fbSet(`/rooms/${roomCode}/players/${myId}`, playerData);
@@ -1239,7 +1263,7 @@ async function hostDoRematch() {
   Object.entries(room.players||{}).forEach(([id,p]) => {
     players[id] = { ...p, alive:true, role:null, word:null, ready:false };
   });
-  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, allClues:{}, votes:{}, clueOrder:[], clueIndex:0, round:0, _v: Date.now() + (Math.random() * 999 | 0) });
+  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, allClues:{}, votes:{}, kicked:{}, clueOrder:[], clueIndex:0, round:0, _v: Date.now() + (Math.random() * 999 | 0) });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1252,6 +1276,17 @@ async function onRoomState(room) {
   }
   onlineRoom = room;
   const phase = room.phase;
+
+  // Vérifier si ce joueur a été expulsé
+  if (myId && room.kicked && room.kicked[myId]) {
+    stopListening();
+    clearTimers();
+    clearSession();
+    roomCode = null; myName = null; myId = null; isHost = false; onlineRoom = null;
+    showScreen('screen-online-menu');
+    showSnackbar('🚫 Vous avez été expulsé de la partie.');
+    return;
+  }
 
   // Handle non-host watching for pendingClue to advance
   if (phase === 'clues' && isHost) {
@@ -1379,7 +1414,7 @@ function closeQuitModal() {
 }
 // Close quit modal on Escape key (desktop UX)
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeQuitModal();
+  if (e.key === 'Escape') { closeQuitModal(); closeKickModal(); }
 });
 function confirmQuitGame() {
   closeQuitModal();
@@ -1412,6 +1447,40 @@ async function leaveRoom() {
   showScreen('screen-online-menu');
 }
 
+// ══════════════════════════════════════════════════════════════
+// ONLINE — KICK PLAYER (host only)
+// ══════════════════════════════════════════════════════════════
+let pendingKickId = null;
+
+function confirmKickPlayer(playerId, playerName) {
+  if (!isHost) return;
+  pendingKickId = playerId;
+  document.getElementById('kick-modal-text').textContent =
+    `Voulez-vous vraiment expulser "${playerName}" de la salle ?`;
+  document.getElementById('kick-modal').style.display = 'flex';
+}
+
+function closeKickModal() {
+  document.getElementById('kick-modal').style.display = 'none';
+  pendingKickId = null;
+}
+
+async function executeKick() {
+  if (!isHost || !pendingKickId || !roomCode) { closeKickModal(); return; }
+  const kickedId = pendingKickId;
+  closeKickModal();
+  try {
+    // Write a kicked flag so the expelled player knows to leave
+    await fbUpdate(`/rooms/${roomCode}/kicked`, { [kickedId]: true });
+    // Remove from players list
+    await fbDelete(`/rooms/${roomCode}/players/${kickedId}`);
+    await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() + (Math.random() * 999 | 0) });
+    showSnackbar('✅ Joueur expulsé');
+  } catch(e) {
+    showSnackbar('❌ Erreur lors de l\'expulsion');
+  }
+}
+
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -1437,15 +1506,27 @@ function renderLobby(room) {
   document.getElementById('lobby-code').textContent = roomCode || room.code || '······';
 
   const list = document.getElementById('lobby-players-list');
-  list.innerHTML = players.map(p => `
-    <div class="lobby-player">
-      <div class="online-dot"></div>
-      <div class="player-avatar" style="width:36px;height:36px;font-size:13px;">${p.name.slice(0,2).toUpperCase()}</div>
-      <div style="flex:1; font-weight:500;">${p.name}</div>
-      ${p.isHost ? '<span class="host-badge">Hôte</span>' : ''}
-      ${p.id === myId ? '<span class="me-badge">Vous</span>' : ''}
-    </div>
-  `).join('');
+  list.innerHTML = '';
+  players.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'lobby-player';
+    row.innerHTML =
+      '<div class="online-dot"></div>' +
+      '<div class="player-avatar" style="width:36px;height:36px;font-size:13px;">' + p.name.slice(0,2).toUpperCase() + '</div>' +
+      '<div style="flex:1; font-weight:500;">' + p.name + '</div>' +
+      (p.isHost ? '<span class="host-badge">Hôte</span>' : '') +
+      (p.id === myId ? '<span class="me-badge">Vous</span>' : '');
+    if (isHost && !p.isHost && p.id !== myId) {
+      const kickBtn = document.createElement('button');
+      kickBtn.textContent = '✕ Expulser';
+      kickBtn.style.cssText = 'background:rgba(255,71,87,0.12);border:1px solid rgba(255,71,87,0.3);color:var(--red);border-radius:8px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;';
+      kickBtn.onmouseover = () => kickBtn.style.background = 'rgba(255,71,87,0.28)';
+      kickBtn.onmouseout = () => kickBtn.style.background = 'rgba(255,71,87,0.12)';
+      kickBtn.onclick = () => confirmKickPlayer(p.id, p.name);
+      row.appendChild(kickBtn);
+    }
+    list.appendChild(row);
+  });
 
   const cfg = room.config || onlineConfig;
   document.getElementById('lobby-config-preview').innerHTML = `
