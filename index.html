@@ -187,7 +187,7 @@
   .empty-state .empty-icon { font-size:48px; margin-bottom:12px; }
   .empty-state p { font-size:14px; line-height:1.6; }
 
-  .snackbar { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(80px); background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 20px; font-size:14px; z-index:1000; transition:transform 0.3s cubic-bezier(0.34,1.56,0.64,1); white-space:nowrap; box-shadow:0 8px 32px rgba(0,0,0,0.3); }
+  .snackbar { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(80px); background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-sm); padding:12px 20px; font-size:14px; z-index:200; transition:transform 0.3s cubic-bezier(0.34,1.56,0.64,1); white-space:nowrap; box-shadow:0 8px 32px rgba(0,0,0,0.3); }
   .snackbar.show { transform:translateX(-50%) translateY(0); }
 
   .dots-row { display:flex; gap:6px; justify-content:center; margin-top:16px; }
@@ -212,7 +212,7 @@
   .room-code-sm { font-family:'Space Mono',monospace; font-size:22px; font-weight:700; letter-spacing:6px; color:var(--accent); }
 
   /* CHAT / MESSAGES */
-  .messages-area { padding:0 24px; max-height:280px; overflow-y:auto; display:flex; flex-direction:column; gap:8px; }
+  .messages-area { padding:0 24px 64px; max-height:280px; overflow-y:auto; display:flex; flex-direction:column; gap:8px; }
   .message-bubble { padding:10px 14px; border-radius:12px; max-width:85%; animation:slideIn 0.2s ease; }
   .message-bubble.mine { background:linear-gradient(135deg,rgba(124,92,252,0.2),rgba(252,92,125,0.2)); border:1px solid rgba(124,92,252,0.3); align-self:flex-end; }
   .message-bubble.other { background:var(--surface2); border:1px solid var(--border); align-self:flex-start; }
@@ -526,6 +526,13 @@
       <div class="alert alert-danger" id="vote-status-msg">☝️ Votez pour éliminer quelqu'un</div>
       <div id="online-vote-list"></div>
       <button class="btn btn-danger btn-lg" id="online-confirm-vote-btn" onclick="onlineConfirmVote()" style="margin-top:8px;" disabled>Confirmer mon vote</button>
+    </div>
+  </div>
+
+  <!-- PHASE: TIE NOTICE -->
+  <div id="phase-tie-notice" style="display:none;">
+    <div style="padding:0 24px;">
+      <div class="alert alert-warning" style="text-align:center; font-size:15px; font-weight:600;">⚖️ Égalité ! Personne n'est éliminé.<br><span style="font-size:13px; font-weight:400; color:var(--muted);">La manche reprend...</span></div>
     </div>
   </div>
 
@@ -1216,6 +1223,32 @@ async function resolveVote() {
   let maxV=0, eliminatedId=null;
   Object.entries(tally).forEach(([id,v]) => { if(v>maxV){maxV=v;eliminatedId=id;} });
 
+  // Vérifier l'égalité : si plusieurs joueurs ont le même nombre de votes max → personne n'est éliminé
+  if (maxV > 0) {
+    const tiedIds = Object.entries(tally).filter(([,v]) => v === maxV).map(([id]) => id);
+    if (tiedIds.length > 1) {
+      // Égalité — personne n'est éliminé, on reprend une nouvelle manche
+      const newRound = (room.round||1) + 1;
+      await fbUpdate(`/rooms/${roomCode}`, {
+        phase: 'tie_notice',
+        round: newRound,
+        votes: {},
+        voteTimerEnd: null,
+        tieNoticeEnd: Date.now() + 3000,
+        _v: Date.now() + (Math.random() * 999 | 0)
+      });
+      // After 3s, start next clue round
+      setTimeout(async () => {
+        if (isHost) {
+          const r = await fbGet(`/rooms/${roomCode}`);
+          if (r) await hostDoStartClues(r);
+        }
+      }, 3000);
+      isResolvingVote = false;
+      return;
+    }
+  }
+
   const players = { ...room.players };
   let mrWhiteElim = false;
   if (eliminatedId && players[eliminatedId]) {
@@ -1366,7 +1399,7 @@ async function onRoomState(room) {
   } else if (phase === 'reveal') {
     renderOnlineReveal(room);
     showScreen('screen-online-reveal');
-  } else if (phase === 'clues' || phase === 'discussion' || phase === 'vote' || phase === 'mrwhite_guess') {
+  } else if (phase === 'clues' || phase === 'discussion' || phase === 'vote' || phase === 'mrwhite_guess' || phase === 'tie_notice') {
     renderOnlineGame(room);
     showScreen('screen-online-game');
   } else if (phase === 'end') {
@@ -1626,7 +1659,7 @@ function renderOnlineGame(room) {
 
   // Round / phase title
   document.getElementById('online-round-label').textContent = `MANCHE ${room.round||1}`;
-  const phaseTitles = { clues:'INDICES', discussion:'DISCUSSION', vote:'VOTE' };
+  const phaseTitles = { clues:'INDICES', discussion:'DISCUSSION', vote:'VOTE', tie_notice:'ÉGALITÉ' };
   document.getElementById('online-phase-title').textContent = phaseTitles[phase] || phase.toUpperCase();
 
   // Players list
@@ -1636,6 +1669,10 @@ function renderOnlineGame(room) {
   document.getElementById('phase-clues').style.display = phase==='clues' ? 'block' : 'none';
   document.getElementById('phase-discussion').style.display = phase==='discussion' ? 'block' : 'none';
   document.getElementById('phase-vote').style.display = phase==='vote' ? 'block' : 'none';
+
+  // Tie notice
+  const tieNoticeEl = document.getElementById('phase-tie-notice');
+  if (tieNoticeEl) tieNoticeEl.style.display = phase==='tie_notice' ? 'block' : 'none';
 
   // Le wrapper des indices est visible dès qu'il y a des indices (toutes phases)
   const allCluesMerged = { ...(room.allClues || {}), ...(room.clues || {}) };
@@ -1650,14 +1687,20 @@ function renderOnlineGame(room) {
 
 function renderOnlinePlayers(room) {
   const list = document.getElementById('online-players-list');
+  // Compact chip-style display: only first name, minimal space
+  list.style.cssText = 'padding:8px 16px; display:flex; flex-wrap:wrap; gap:6px;';
   list.innerHTML = (room.players||[]).map(p => {
-    const initials = p.name.slice(0,2).toUpperCase();
+    const firstName = p.name.split(' ')[0];
+    const initials = firstName.slice(0,2).toUpperCase();
+    const isMine = p.id === myId;
+    const isElim = !p.alive;
     const roleLabel = room.phase === 'end' || (p.eliminated && room.config?.revealRole)
-      ? ` <span class="role-badge role-${p.role||'innocent'}" style="font-size:10px;">${{innocent:'Innocent',impostor:'Imposteur',mrwhite:'M.White'}[p.role||'innocent']||''}</span>` : '';
+      ? ` <span class="role-badge role-${p.role||'innocent'}" style="font-size:9px;padding:2px 6px;">${{innocent:'Innocent',impostor:'Imposteur',mrwhite:'M.W'}[p.role||'innocent']||''}</span>` : '';
     return `
-      <div class="player-game-item${p.alive?'':' eliminated'}">
-        <div class="player-avatar" style="width:36px;height:36px;font-size:13px;${p.id===myId?'border:2px solid var(--accent);':''}">${initials}</div>
-        <div class="player-game-name">${p.name}${p.id===myId?' <small style="color:var(--accent)">(vous)</small>':''}${p.isHost?' <small style="color:#ffa500">♛</small>':''}${!p.alive?` <small style="color:var(--muted)">(éliminé)</small>`:''}</div>
+      <div style="display:inline-flex;align-items:center;gap:5px;padding:5px 10px 5px 5px;background:var(--surface);border:1px solid ${isMine?'var(--accent)':'var(--border)'};border-radius:20px;${isElim?'opacity:0.4;':''}font-size:13px;font-weight:500;flex-shrink:0;">
+        <div style="width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff;font-family:'Space Mono',monospace;flex-shrink:0;">${initials}</div>
+        <span style="${isElim?'text-decoration:line-through;color:var(--muted);':''}">${firstName}${p.isHost?' ♛':''}</span>
+        ${isElim?'<span style="font-size:10px;color:var(--muted);">✕</span>':''}
         ${roleLabel}
       </div>
     `;
@@ -1783,8 +1826,14 @@ function renderCluesPhase(room, isAlive, me) {
 function validateClueInput(input) {
   const words = input.value.trim().split(/\s+/).filter(Boolean);
   document.getElementById('clue-char-count').textContent = `${input.value.length}/25 · ${words.length}/3 mots`;
+  const me = (onlineRoom?.players||[]).find(p => p.id === myId);
+  const myWord = me?.word ? me.word.trim().toLowerCase() : '';
+  const clueNorm = input.value.trim().toLowerCase();
   if (words.length > 3) {
     input.style.borderColor = 'var(--red)';
+  } else if (myWord && clueNorm && (clueNorm === myWord || clueNorm.includes(myWord) || myWord.includes(clueNorm))) {
+    input.style.borderColor = 'var(--red)';
+    document.getElementById('clue-char-count').textContent += ' ⚠️ Votre mot interdit !';
   } else {
     input.style.borderColor = '';
   }
@@ -1797,6 +1846,16 @@ function sendClue() {
   const words = val.split(/\s+/).filter(Boolean);
   if (words.length > 3) { showSnackbar('Maximum 3 mots !'); return; }
   if (val.length > 25) { showSnackbar('Maximum 25 caractères !'); return; }
+  // Empêcher d'écrire son propre mot
+  const me = (onlineRoom?.players||[]).find(p => p.id === myId);
+  if (me && me.word) {
+    const myWord = me.word.trim().toLowerCase();
+    const clueNorm = val.trim().toLowerCase();
+    if (clueNorm === myWord || clueNorm.includes(myWord) || myWord.includes(clueNorm)) {
+      showSnackbar('❌ Vous ne pouvez pas utiliser votre propre mot !');
+      return;
+    }
+  }
   send({ type:'send_clue', clue:val });
   input.value = '';
   myClue = val;
