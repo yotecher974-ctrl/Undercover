@@ -89,7 +89,7 @@
   input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(124,92,252,0.15); }
 
   .stepper { display:flex; align-items:center; gap:12px; background:var(--surface2); border:1px solid var(--border); border-radius:var(--radius-sm); padding:8px; }
-  .stepper-btn { width:36px; height:36px; border-radius:8px; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:18px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all var(--transition); flex-shrink:0; }
+  .stepper-btn { width:48px; height:48px; border-radius:10px; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:22px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all var(--transition); flex-shrink:0; touch-action:manipulation; }
   .stepper-btn:hover { background:var(--accent); border-color:var(--accent); color:#fff; }
   .stepper-val { flex:1; text-align:center; font-family:'Space Mono',monospace; font-size:20px; font-weight:700; color:var(--text); }
 
@@ -282,6 +282,18 @@
   </div>
 </div>
 
+<!-- ELIMINATION REVEAL MODAL -->
+<div id="elim-reveal-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:550; align-items:center; justify-content:center; padding:24px;">
+  <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:32px 24px; max-width:360px; width:100%; text-align:center; animation:popIn 0.3s cubic-bezier(0.34,1.56,0.64,1);">
+    <div id="elim-reveal-icon" style="font-size:56px; margin-bottom:12px;"></div>
+    <div style="font-family:'Bebas Neue',sans-serif; font-size:13px; letter-spacing:3px; color:var(--muted); margin-bottom:6px;">ÉLIMINÉ</div>
+    <div id="elim-reveal-name" style="font-family:'Bebas Neue',sans-serif; font-size:32px; letter-spacing:3px; margin-bottom:12px;"></div>
+    <div id="elim-reveal-role-badge" style="margin-bottom:20px;"></div>
+    <div id="elim-reveal-desc" style="font-size:14px; color:var(--muted); line-height:1.5; margin-bottom:24px;"></div>
+    <button class="btn btn-primary" onclick="closeElimRevealModal()">Continuer ›</button>
+  </div>
+</div>
+
 <!-- MR WHITE MODAL -->
 <div id="mrWhiteModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:500; display:none; align-items:center; justify-content:center; padding:24px;">
   <div style="background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:32px 24px; max-width:360px; width:100%; text-align:center;">
@@ -380,17 +392,17 @@
     </div>
 
     <div class="section-title" style="margin-top:8px;">Configuration</div>
-    <div class="card">
+    <div class="card" style="cursor:pointer;" onclick="changeOnlineCount('impostors',1)" oncontextmenu="changeOnlineCount('impostors',-1);return false;" title="Clic gauche: augmenter · Clic droit: diminuer">
       <div class="card-label">Imposteurs</div>
-      <div class="stepper">
+      <div class="stepper" onclick="event.stopPropagation()">
         <button class="stepper-btn" onclick="changeOnlineCount('impostors',-1)">−</button>
         <div class="stepper-val" id="online-val-impostors">1</div>
         <button class="stepper-btn" onclick="changeOnlineCount('impostors',1)">+</button>
       </div>
     </div>
-    <div class="card">
+    <div class="card" style="cursor:pointer;" onclick="changeOnlineCount('mrwhite',1)" oncontextmenu="changeOnlineCount('mrwhite',-1);return false;" title="Clic gauche: augmenter · Clic droit: diminuer">
       <div class="card-label">M. White</div>
-      <div class="stepper">
+      <div class="stepper" onclick="event.stopPropagation()">
         <button class="stepper-btn" onclick="changeOnlineCount('mrwhite',-1)">−</button>
         <div class="stepper-val" id="online-val-mrwhite">0</div>
         <button class="stepper-btn" onclick="changeOnlineCount('mrwhite',1)">+</button>
@@ -599,17 +611,17 @@
         <button class="stepper-btn" onclick="changeCount('players',1)">+</button>
       </div>
     </div>
-    <div class="card">
+    <div class="card" style="cursor:pointer;" onclick="changeCount('impostors',1)" oncontextmenu="changeCount('impostors',-1);return false;" title="Clic gauche: augmenter · Clic droit: diminuer">
       <div class="card-label">Imposteurs <span class="badge badge-red">🕵️ Mot différent</span></div>
-      <div class="stepper">
+      <div class="stepper" onclick="event.stopPropagation()">
         <button class="stepper-btn" onclick="changeCount('impostors',-1)">−</button>
         <div class="stepper-val" id="val-impostors">1</div>
         <button class="stepper-btn" onclick="changeCount('impostors',1)">+</button>
       </div>
     </div>
-    <div class="card">
+    <div class="card" style="cursor:pointer;" onclick="changeCount('mrwhite',1)" oncontextmenu="changeCount('mrwhite',-1);return false;" title="Clic gauche: augmenter · Clic droit: diminuer">
       <div class="card-label">M. White <span class="badge badge-teal">👤 Carte vide</span></div>
-      <div class="stepper">
+      <div class="stepper" onclick="event.stopPropagation()">
         <button class="stepper-btn" onclick="changeCount('mrwhite',-1)">−</button>
         <div class="stepper-val" id="val-mrwhite">0</div>
         <button class="stepper-btn" onclick="changeCount('mrwhite',1)">+</button>
@@ -1640,19 +1652,28 @@ function renderLobby(room) {
   const cfg = room.config || onlineConfig;
   document.getElementById('lobby-config-preview').innerHTML = `
     <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px; align-items:center;">
-      <span class="badge badge-red" style="${isHost?'cursor:pointer;border:1px dashed rgba(255,71,87,0.5);':''}">
-        🕵️ <span id="lobby-imp-count" onclick="${isHost?'editLobbyCount(event,\'impostors\')':''}" style="${isHost?'cursor:pointer;text-decoration:underline dotted;':''}">
+      <span class="badge badge-red" style="${isHost?'cursor:pointer;border:1px dashed rgba(255,71,87,0.5);user-select:none;':''}">
+        🕵️ <span id="lobby-imp-count" onclick="${isHost?'editLobbyCount(event,\'impostors\')':''}">
           ${cfg.impostors}</span> imposteur${cfg.impostors>1?'s':''}
       </span>
-      ${cfg.mrwhite>0 || isHost ? `<span class="badge badge-teal" style="${isHost?'cursor:pointer;border:1px dashed rgba(78,205,196,0.4);':''}">
-        👤 <span id="lobby-mrw-count" onclick="${isHost?'editLobbyCount(event,\'mrwhite\')':''}" style="${isHost?'cursor:pointer;text-decoration:underline dotted;':''}">
+      ${cfg.mrwhite>0 || isHost ? `<span class="badge badge-teal" style="${isHost?'cursor:pointer;border:1px dashed rgba(78,205,196,0.4);user-select:none;':''}">
+        👤 <span id="lobby-mrw-count" onclick="${isHost?'editLobbyCount(event,\'mrwhite\')':''}">
           ${cfg.mrwhite}</span> M.White
       </span>` : ''}
       <span class="badge badge-accent">⏱ ${cfg.discuss}s discussion</span>
       ${cfg.revealRole ? '<span class="badge badge-accent">👁 Rôles révélés</span>' : ''}
     </div>
-    ${isHost ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">💡 Cliquez sur les nombres pour les modifier</div>' : ''}
+    ${isHost ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">💡 Cliquez sur les badges pour modifier</div>' : ''}
   `;
+  // Attach click handlers on the entire badge (not just the number)
+  if (isHost) {
+    setTimeout(() => {
+      const impBadge = document.getElementById('lobby-imp-count')?.closest('.badge');
+      const mrwBadge = document.getElementById('lobby-mrw-count')?.closest('.badge');
+      if (impBadge) impBadge.onclick = (e) => editLobbyCount(e, 'impostors');
+      if (mrwBadge) mrwBadge.onclick = (e) => editLobbyCount(e, 'mrwhite');
+    }, 0);
+  }
 
   const canStart = players.length >= 3;
   if (isHost) {
@@ -1674,7 +1695,10 @@ function renderLobby(room) {
 function editLobbyCount(event, key) {
   if (!isHost) return;
   event.stopPropagation();
-  const span = event.target;
+  // Find the number span (may have clicked on the badge wrapper)
+  const spanId = key === 'impostors' ? 'lobby-imp-count' : 'lobby-mrw-count';
+  const span = document.getElementById(spanId);
+  if (!span) return;
   const current = parseInt(span.textContent.trim()) || 0;
 
   // Prevent double edit
