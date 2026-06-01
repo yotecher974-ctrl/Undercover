@@ -1160,7 +1160,7 @@ async function hostDoStartGame() {
     innocentWord: pair[0],
     impostorWord: pair[1],
     round: 1,
-    clues: {}, allClues: {}, votes: {}, chat: [],
+    clues: {}, allClues: {}, cluesList: [], allCluesList: [], votes: {}, chat: [],
     clueOrder: [], clueIndex: 0,
     winner: null, voteTimerEnd: null, discussEnd: null,
     _v: Date.now() + (Math.random() * 999 | 0)
@@ -1193,9 +1193,10 @@ async function hostDoStartClues(room) {
     clueOrder: order,
     clueIndex: 0,
     clues: {},
+    cluesList: [],
     pendingClue: null,
     _v: Date.now() + (Math.random() * 999 | 0)
-    // allClues is intentionally preserved across rounds
+    // allClues / allCluesList are intentionally preserved across rounds
   });
 }
 
@@ -1211,15 +1212,24 @@ async function advanceClue(fromId, clueText) {
   // Si on n'a toujours pas l'indice, on abandonne
   if (!resolvedClue) return;
 
+  // Maintain ordered list for display
+  const currentCluesList = Array.isArray(room.cluesList) ? room.cluesList : [];
+  const newCluesList = [...currentCluesList, { playerId: fromId, clue: resolvedClue }];
+
   const newIndex = room.clueIndex + 1;
   if (newIndex >= order.length) {
     // Tout le monde a joué : fusionner dans allClues et passer en discussion
     const cluesMerged = { ...(room.clues || {}), [fromId]: resolvedClue };
     const allMerged = { ...(room.allClues || {}), ...cluesMerged };
+    // allCluesList = previous rounds + this round (ordered)
+    const prevAllCluesList = Array.isArray(room.allCluesList) ? room.allCluesList : [];
+    const allCluesList = [...prevAllCluesList, ...newCluesList];
     await fbUpdate(`/rooms/${roomCode}`, {
       [`clues/${fromId}`]: resolvedClue,
+      cluesList: newCluesList,
       pendingClue: null,
       allClues: allMerged,
+      allCluesList: allCluesList,
       _v: Date.now() + (Math.random() * 999 | 0)
     });
     await hostDoStartDiscussion();
@@ -1227,6 +1237,7 @@ async function advanceClue(fromId, clueText) {
     // Avancer au joueur suivant — tout en un seul update atomique
     await fbUpdate(`/rooms/${roomCode}`, {
       [`clues/${fromId}`]: resolvedClue,
+      cluesList: newCluesList,
       pendingClue: null,
       clueIndex: newIndex,
       _v: Date.now() + (Math.random() * 999 | 0)
@@ -1317,10 +1328,23 @@ async function resolveVote() {
 async function checkEndConditionsOnline(players, room) {
   const alive = Object.values(players).filter(p=>p.alive);
   const impostors = alive.filter(p=>p.role==='impostor');
+  const mrWhites = alive.filter(p=>p.role==='mrwhite');
   const suspects = alive.filter(p=>p.role==='impostor'||p.role==='mrwhite');
   const innocents = alive.filter(p=>p.role==='innocent');
+
+  // All suspects eliminated → innocents win
   if (suspects.length===0) { await fbUpdate(`/rooms/${roomCode}`, {phase:'end', winner:'innocents', _v: Date.now() + (Math.random() * 999 | 0)}); return; }
+
+  // Impostors win if they match or outnumber innocents
   if (impostors.length>0 && innocents.length<=impostors.length) { await fbUpdate(`/rooms/${roomCode}`, {phase:'end', winner:'impostor', _v: Date.now() + (Math.random() * 999 | 0)}); return; }
+
+  // Special case: exactly 1 innocent and 1 MrWhite remain (no impostors) → MrWhite gets to guess
+  if (impostors.length===0 && mrWhites.length===1 && innocents.length===1) {
+    const mrwPlayer = mrWhites[0];
+    await fbSet(`/rooms/${roomCode}`, { ...room, players, phase: 'mrwhite_guess', votes:{}, voteTimerEnd:null, mrWhiteId: mrwPlayer.id, mrWhiteLastChance: true, _v: Date.now() + (Math.random() * 999 | 0) });
+    return;
+  }
+
   await hostDoStartClues({ ...room, players });
 }
 
@@ -1331,8 +1355,13 @@ async function submitMrWhiteGuessOnline(guess) {
   if (guess.toLowerCase() === correct.toLowerCase()) {
     await fbUpdate(`/rooms/${roomCode}`, { phase:'end', winner:'mrwhite', _v: Date.now() + (Math.random() * 999 | 0) });
   } else {
-    const players = room.players || {};
-    await checkEndConditionsOnline(players, room);
+    // If this was the last-chance guess (1 innocent vs 1 MrWhite), innocents win
+    if (room.mrWhiteLastChance) {
+      await fbUpdate(`/rooms/${roomCode}`, { phase:'end', winner:'innocents', _v: Date.now() + (Math.random() * 999 | 0) });
+    } else {
+      const players = room.players || {};
+      await checkEndConditionsOnline(players, room);
+    }
   }
 }
 
@@ -1343,7 +1372,7 @@ async function hostDoRematch() {
   Object.entries(room.players||{}).forEach(([id,p]) => {
     players[id] = { ...p, alive:true, role:null, word:null, ready:false };
   });
-  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, allClues:{}, votes:{}, kicked:{}, clueOrder:[], clueIndex:0, round:0, chat:[], _v: Date.now() + (Math.random() * 999 | 0) });
+  await fbSet(`/rooms/${roomCode}`, { ...room, phase:'lobby', winner:null, players, clues:{}, allClues:{}, cluesList:[], allCluesList:[], votes:{}, kicked:{}, clueOrder:[], clueIndex:0, round:0, chat:[], _v: Date.now() + (Math.random() * 999 | 0) });
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1447,8 +1476,16 @@ async function onRoomState(room) {
 }
 
 function showMrWhiteModalOnline(player) {
+  const room = onlineRoom;
+  const isLastChance = room && room.mrWhiteLastChance;
   document.getElementById('mrWhitePlayerName').textContent = `${player.name} est M. White !`;
   document.getElementById('mrWhiteGuessInput').value = '';
+  const descEl = document.querySelector('#mrWhiteModal p:not(#mrWhitePlayerName)');
+  if (descEl) {
+    descEl.textContent = isLastChance
+      ? '⚠️ Dernier face-à-face ! Il ne reste qu\'un innocent. Devinez le mot pour gagner, sinon les innocents gagnent :'
+      : 'Vous avez été éliminé. Tapez le mot que vous pensez être le bon :';
+  }
   document.getElementById('mrWhiteModal').style.display = 'flex';
   // Override submit to online version
   document.getElementById('mrWhiteModal')._online = true;
@@ -1602,12 +1639,19 @@ function renderLobby(room) {
 
   const cfg = room.config || onlineConfig;
   document.getElementById('lobby-config-preview').innerHTML = `
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px;">
-      <span class="badge badge-red">🕵️ ${cfg.impostors} imposteur${cfg.impostors>1?'s':''}</span>
-      ${cfg.mrwhite>0 ? `<span class="badge badge-teal">👤 ${cfg.mrwhite} M.White</span>` : ''}
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px; align-items:center;">
+      <span class="badge badge-red" style="${isHost?'cursor:pointer;border:1px dashed rgba(255,71,87,0.5);':''}">
+        🕵️ <span id="lobby-imp-count" onclick="${isHost?'editLobbyCount(event,\'impostors\')':''}" style="${isHost?'cursor:pointer;text-decoration:underline dotted;':''}">
+          ${cfg.impostors}</span> imposteur${cfg.impostors>1?'s':''}
+      </span>
+      ${cfg.mrwhite>0 || isHost ? `<span class="badge badge-teal" style="${isHost?'cursor:pointer;border:1px dashed rgba(78,205,196,0.4);':''}">
+        👤 <span id="lobby-mrw-count" onclick="${isHost?'editLobbyCount(event,\'mrwhite\')':''}" style="${isHost?'cursor:pointer;text-decoration:underline dotted;':''}">
+          ${cfg.mrwhite}</span> M.White
+      </span>` : ''}
       <span class="badge badge-accent">⏱ ${cfg.discuss}s discussion</span>
       ${cfg.revealRole ? '<span class="badge badge-accent">👁 Rôles révélés</span>' : ''}
     </div>
+    ${isHost ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">💡 Cliquez sur les nombres pour les modifier</div>' : ''}
   `;
 
   const canStart = players.length >= 3;
@@ -1625,8 +1669,52 @@ function renderLobby(room) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ONLINE — HOST ACTIONS
+// ONLINE — LOBBY EDIT COUNT (host only)
 // ══════════════════════════════════════════════════════════════
+function editLobbyCount(event, key) {
+  if (!isHost) return;
+  event.stopPropagation();
+  const span = event.target;
+  const current = parseInt(span.textContent.trim()) || 0;
+
+  // Prevent double edit
+  if (span.querySelector('input')) return;
+
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.value = current;
+  input.min = key === 'impostors' ? 1 : 0;
+  input.max = key === 'impostors' ? 5 : 3;
+  input.style.cssText = 'width:40px;background:var(--surface2);border:1px solid var(--accent);border-radius:4px;color:var(--text);font-size:13px;font-weight:700;text-align:center;padding:1px 2px;';
+
+  const originalText = span.textContent;
+  span.textContent = '';
+  span.appendChild(input);
+  input.focus();
+  input.select();
+
+  const confirm = async () => {
+    const val = parseInt(input.value);
+    if (!isNaN(val)) {
+      const newVal = Math.max(parseInt(input.min), Math.min(parseInt(input.max), val));
+      onlineConfig[key] = newVal;
+      // Update Firebase config
+      if (roomCode) {
+        await fbUpdate(`/rooms/${roomCode}/config`, { [key]: newVal, _v: Date.now() });
+        await fbUpdate(`/rooms/${roomCode}`, { _v: Date.now() + (Math.random() * 999 | 0) });
+      }
+    }
+    // Re-render will happen via polling
+  };
+
+  input.addEventListener('blur', confirm);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { input.blur(); }
+    if (e.key === 'Escape') { span.textContent = originalText; }
+  });
+}
+
+
 function onlineStartGame() {
   if (!isHost) return;
   send({ type:'start_game' });
@@ -1714,8 +1802,8 @@ function renderOnlineGame(room) {
   if (tieNoticeEl) tieNoticeEl.style.display = phase==='tie_notice' ? 'block' : 'none';
 
   // Le wrapper des indices est visible dès qu'il y a des indices (toutes phases)
-  const allCluesMerged = { ...(room.allClues || {}), ...(room.clues || {}) };
-  const hasClues = Object.keys(allCluesMerged).length > 0;
+  const allCluesMerged = Array.isArray(room.allCluesList) ? room.allCluesList : (Object.keys({...(room.allClues||{}), ...(room.clues||{})}).length > 0 ? [{}] : []);
+  const hasClues = allCluesMerged.length > 0;
   const wrapper = document.getElementById('clues-messages-wrapper');
   if (wrapper) wrapper.style.display = hasClues ? 'block' : 'none';
 
@@ -1763,46 +1851,46 @@ function renderCluesPhase(room, isAlive, me) {
   msgArea.innerHTML = '';
   const allPlayers = room.players || [];
 
-  // Afficher les indices des manches précédentes (allClues) en grisé
-  const allClues = room.allClues || {};
-  const prevClueIds = Object.keys(allClues);
-  if (prevClueIds.length > 0) {
+  // Afficher les indices des manches précédentes (allCluesList) en grisé
+  const allCluesList = Array.isArray(room.allCluesList) ? room.allCluesList : [];
+  if (allCluesList.length > 0) {
     const prevDiv = document.createElement('div');
     prevDiv.style.cssText = 'opacity:0.55; margin-bottom:8px; padding-bottom:8px; border-bottom:1px solid var(--border);';
     prevDiv.innerHTML = '<div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);text-align:center;margin-bottom:6px;">Indices des manches précédentes</div>';
-    prevClueIds.forEach(pid => {
-      const player = allPlayers.find(p => p.id === pid);
-      const clue = allClues[pid];
-      if (!player || !clue) return;
-      const isMine = pid === myId;
+    allCluesList.forEach(entry => {
+      const player = allPlayers.find(p => p.id === entry.playerId);
+      if (!player || !entry.clue) return;
+      const isMine = entry.playerId === myId;
       const d = document.createElement('div');
       d.className = 'message-bubble ' + (isMine ? 'mine' : 'other');
-      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + clue + '</div>';
+      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + entry.clue + '</div>';
       prevDiv.appendChild(d);
     });
     msgArea.appendChild(prevDiv);
   }
 
-  // Afficher les indices de la manche en cours
-  order.forEach(pid => {
-    const player = allPlayers.find(p => p.id === pid);
-    // Indice confirmé dans clues, ou encore en pendingClue (filet de sécurité visuel)
-    const clue = clues[pid] || (room.pendingClue?.from === pid ? room.pendingClue.clue : null);
+  // Afficher les indices de la manche en cours (dans l'ordre d'écriture)
+  const currentCluesList = Array.isArray(room.cluesList) ? room.cluesList : [];
+  // Also include any pending clue not yet in cluesList
+  const pendingEntry = room.pendingClue && room.pendingClue.from ? room.pendingClue : null;
+  const shownIds = new Set(currentCluesList.map(e => e.playerId));
+  const displayList = [...currentCluesList];
+  if (pendingEntry && !shownIds.has(pendingEntry.from)) {
+    displayList.push({ playerId: pendingEntry.from, clue: pendingEntry.clue });
+  }
 
-    if (!player || !clue) return;
-
-    const isMine = pid === myId;
-
+  displayList.forEach(entry => {
+    const player = allPlayers.find(p => p.id === entry.playerId);
+    if (!player || !entry.clue) return;
+    const isMine = entry.playerId === myId;
     const div = document.createElement('div');
     div.className = `message-bubble ${isMine ? 'mine' : 'other'}`;
-
     div.innerHTML = `
       <div class="msg-author" style="color:${isMine ? 'var(--accent)' : 'var(--muted)'};">
         ${player.name}
       </div>
-      <div class="msg-text">${clue}</div>
+      <div class="msg-text">${entry.clue}</div>
     `;
-
     msgArea.appendChild(div);
   });
 
@@ -1906,6 +1994,23 @@ function renderDiscussionPhase(room) {
   clearCountdown();
   document.getElementById('host-start-vote').style.display = isHost ? 'block' : 'none';
 
+  // Show all clues (ordered) in the clues panel during discussion
+  const allCluesList = Array.isArray(room.allCluesList) ? room.allCluesList : [];
+  const msgArea = document.getElementById('clues-messages');
+  if (msgArea && allCluesList.length > 0) {
+    msgArea.innerHTML = '<div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);text-align:center;margin-bottom:8px;">Indices donnés</div>';
+    allCluesList.forEach(entry => {
+      const player = (room.players || []).find(p => p.id === entry.playerId);
+      if (!player || !entry.clue) return;
+      const isMine = entry.playerId === myId;
+      const d = document.createElement('div');
+      d.className = 'message-bubble ' + (isMine ? 'mine' : 'other');
+      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + entry.clue + '</div>';
+      msgArea.appendChild(d);
+    });
+    msgArea.scrollTop = msgArea.scrollHeight;
+  }
+
   if (room.discussEnd) {
     startCountdown('online-timer-area', room.discussEnd, room.config?.discuss || 120);
   } else {
@@ -1913,6 +2018,21 @@ function renderDiscussionPhase(room) {
   }
 
   renderChatMessages(room);
+
+  // Disable chat input for eliminated players
+  const me = (room.players||[]).find(p => p.id === myId);
+  const isAlive = me && me.alive;
+  const chatInput = document.getElementById('chat-input');
+  const chatSendBtn = document.querySelector('.chat-send-btn');
+  if (chatInput) {
+    chatInput.disabled = !isAlive;
+    chatInput.placeholder = isAlive ? 'Votre message...' : '🚫 Éliminé — chat désactivé';
+    chatInput.style.opacity = isAlive ? '1' : '0.4';
+  }
+  if (chatSendBtn) {
+    chatSendBtn.disabled = !isAlive;
+    chatSendBtn.style.opacity = isAlive ? '1' : '0.3';
+  }
 }
 
 // ── CHAT ──
@@ -1955,6 +2075,15 @@ async function sendChatMessage() {
   if (!input) return;
   const text = input.value.trim();
   if (!text || !roomCode || !myId) return;
+
+  // Block eliminated players from chatting
+  const me = (onlineRoom?.players||[]).find(p => p.id === myId);
+  if (me && !me.alive) {
+    showSnackbar('❌ Vous avez été éliminé — vous ne pouvez plus écrire dans le chat.');
+    input.value = '';
+    return;
+  }
+
   input.value = '';
 
   const msg = {
@@ -1977,20 +2106,18 @@ async function sendChatMessage() {
 // ── VOTE PHASE ──
 function renderVotePhase(room, isAlive, me) {
   clearCountdown();
-  // Rafraîchir l'affichage des indices (tous les joueurs peuvent les voir)
-  const allCluesToShow = { ...(room.allClues || {}), ...(room.clues || {}) };
-  const clueIdsToShow = Object.keys(allCluesToShow);
+  // Rafraîchir l'affichage des indices dans l'ordre d'écriture
+  const allCluesList = Array.isArray(room.allCluesList) ? room.allCluesList : [];
   const msgArea = document.getElementById('clues-messages');
-  if (msgArea && clueIdsToShow.length > 0) {
+  if (msgArea && allCluesList.length > 0) {
     msgArea.innerHTML = '<div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);text-align:center;margin-bottom:8px;">Indices donnés</div>';
-    clueIdsToShow.forEach(pid => {
-      const player = (room.players || []).find(p => p.id === pid);
-      const clue = allCluesToShow[pid];
-      if (!player || !clue) return;
-      const isMine = pid === myId;
+    allCluesList.forEach(entry => {
+      const player = (room.players || []).find(p => p.id === entry.playerId);
+      if (!player || !entry.clue) return;
+      const isMine = entry.playerId === myId;
       const d = document.createElement('div');
       d.className = 'message-bubble ' + (isMine ? 'mine' : 'other');
-      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + clue + '</div>';
+      d.innerHTML = '<div class="msg-author" style="color:' + (isMine ? 'var(--accent)' : 'var(--muted)') + ';">' + player.name + '</div><div class="msg-text">' + entry.clue + '</div>';
       msgArea.appendChild(d);
     });
     msgArea.scrollTop = msgArea.scrollHeight;
@@ -2403,7 +2530,15 @@ function submitMrWhiteGuess() {
     if (guess.toLowerCase()===gameState.innocentWord.toLowerCase()) {
       const player = document.getElementById('mrWhiteModal')._player;
       endGame('mrwhite',player);
-    } else { checkEndConditions(); }
+    } else {
+      // If last-chance scenario (1v1), innocents win
+      if (gameState._mrWhiteLastChance) {
+        gameState._mrWhiteLastChance = false;
+        endGame('innocents');
+      } else {
+        checkEndConditions();
+      }
+    }
   }
   document.getElementById('mrWhiteModal')._online = false;
 }
@@ -2416,6 +2551,12 @@ function checkEndConditions() {
   const suspictsAlive = [...impostorsAlive,...mrWhiteAlive];
   if (suspictsAlive.length===0) { endGame('innocents'); return; }
   if (impostorsAlive.length>0 && innocentsAlive.length<=impostorsAlive.length) { endGame('impostor'); return; }
+  // Special: 1 innocent vs 1 MrWhite (no impostors) → MrWhite last chance
+  if (impostorsAlive.length===0 && mrWhiteAlive.length===1 && innocentsAlive.length===1) {
+    gameState._mrWhiteLastChance = true;
+    showMrWhiteModal(mrWhiteAlive[0]);
+    return;
+  }
   showScreen('screen-game'); renderGameScreen();
 }
 
