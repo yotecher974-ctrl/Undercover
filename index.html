@@ -1845,13 +1845,16 @@ function renderOnlinePlayers(room) {
     const initials = firstName.slice(0,2).toUpperCase();
     const isMine = p.id === myId;
     const isElim = !p.alive;
-    const roleLabel = room.phase === 'end' || (p.eliminated && room.config?.revealRole)
-      ? ` <span class="role-badge role-${p.role||'innocent'}" style="font-size:9px;padding:2px 6px;">${{innocent:'Innocent',impostor:'Imposteur',mrwhite:'M.W'}[p.role||'innocent']||''}</span>` : '';
+    const roleColors = { innocent: '#4ecdc4', impostor: '#ff4757', mrwhite: '#e8e8f0' };
+    const roleLabel = isElim
+      ? ` <span class="role-badge role-${p.role||'innocent'}" style="font-size:9px;padding:2px 6px;color:${roleColors[p.role||'innocent']};border-color:${roleColors[p.role||'innocent']}44;background:${roleColors[p.role||'innocent']}18;">${{innocent:'Innocent',impostor:'Imposteur',mrwhite:'M.W'}[p.role||'innocent']||''}</span>`
+      : (room.phase === 'end' ? ` <span class="role-badge role-${p.role||'innocent'}" style="font-size:9px;padding:2px 6px;">${{innocent:'Innocent',impostor:'Imposteur',mrwhite:'M.W'}[p.role||'innocent']||''}</span>` : '');
+    const elimTextColor = isElim ? (roleColors[p.role||'innocent']) : '';
     return `
-      <div style="display:inline-flex;align-items:center;gap:5px;padding:5px 10px 5px 5px;background:var(--surface);border:1px solid ${isMine?'var(--accent)':'var(--border)'};border-radius:20px;${isElim?'opacity:0.4;':''}font-size:13px;font-weight:500;flex-shrink:0;">
+      <div style="display:inline-flex;align-items:center;gap:5px;padding:5px 10px 5px 5px;background:var(--surface);border:1px solid ${isMine?'var(--accent)':isElim?(roleColors[p.role||'innocent']+'44'):'var(--border)'};border-radius:20px;${isElim?'opacity:0.65;':''}font-size:13px;font-weight:500;flex-shrink:0;">
         <div style="width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#fff;font-family:'Space Mono',monospace;flex-shrink:0;">${initials}</div>
-        <span style="${isElim?'text-decoration:line-through;color:var(--muted);':''}">${firstName}${p.isHost?' ♛':''}</span>
-        ${isElim?'<span style="font-size:10px;color:var(--muted);">✕</span>':''}
+        <span style="${isElim?`text-decoration:line-through;color:${elimTextColor};`:''}">${firstName}${p.isHost?' ♛':''}</span>
+        ${isElim?`<span style="font-size:10px;color:${elimTextColor};">✕</span>`:''}
         ${roleLabel}
       </div>
     `;
@@ -2490,7 +2493,11 @@ function renderGameScreen() {
       ...(p.trophies.red>0?['🔴'.repeat(Math.min(p.trophies.red,3))]:[] ),
       ...(p.trophies.white>0?['⚪'.repeat(Math.min(p.trophies.white,3))]:[] ),
     ].join('');
-    div.innerHTML = `<div class="player-avatar">${initials}</div><div class="player-game-name">${p.name}${p.alive?'':' <small style="color:var(--muted)">(éliminé)</small>'}</div><div class="player-trophy">${td}</div>`;
+    const elimRoleColors = { impostor: '#ff4757', mrwhite: '#e8e8f0', innocent: '#4ecdc4' };
+    const elimRoleLabels = { impostor: 'Imposteur', mrwhite: 'M.White', innocent: 'Innocent' };
+    const elimColor = !p.alive ? (elimRoleColors[p.role] || 'var(--muted)') : '';
+    const elimLabel = !p.alive ? `<small style="color:${elimColor};font-weight:600;margin-left:4px;">(${elimRoleLabels[p.role]||'?'})</small>` : '';
+    div.innerHTML = `<div class="player-avatar">${initials}</div><div class="player-game-name" style="${!p.alive?`color:${elimColor};`:''}">${p.name}${elimLabel}</div><div class="player-trophy">${td}</div>`;
     list.appendChild(div);
   });
 }
@@ -2531,8 +2538,41 @@ function confirmVote() {
   eliminated.alive=false;
   gameState.turnOrder = shuffle(gameState.players.map((_,i)=>i).filter(i=>gameState.players[i].alive));
   gameState.round++;
-  if (eliminated.role==='mrwhite') { showMrWhiteModal(eliminated); return; }
-  checkEndConditions();
+  showEliminationReveal(eliminated, () => {
+    if (eliminated.role==='mrwhite') { showMrWhiteModal(eliminated); return; }
+    checkEndConditions();
+  });
+}
+
+function showEliminationReveal(player, callback) {
+  const roleColors = { impostor: '#ff4757', mrwhite: '#e8e8f0', innocent: '#4ecdc4' };
+  const roleLabels = { impostor: '🔴 Imposteur', mrwhite: '⚪ M. White', innocent: '🔵 Innocent' };
+  const roleNames = { impostor: 'IMPOSTEUR', mrwhite: 'M. WHITE', innocent: 'INNOCENT' };
+  const color = roleColors[player.role] || 'var(--text)';
+  const label = roleLabels[player.role] || player.role;
+  const roleName = roleNames[player.role] || player.role;
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.82);z-index:9999;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.25s ease;';
+  overlay.innerHTML = `
+    <div style="background:var(--surface);border:2px solid ${color};border-radius:20px;padding:36px 32px;text-align:center;max-width:320px;width:90%;animation:popIn 0.35s cubic-bezier(0.34,1.56,0.64,1);">
+      <div style="font-size:48px;margin-bottom:12px;">${player.role==='impostor'?'🔴':player.role==='mrwhite'?'⚪':'🔵'}</div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:3px;color:var(--muted);margin-bottom:4px;">ÉLIMINÉ</div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:36px;letter-spacing:2px;color:${color};margin-bottom:16px;">${player.name}</div>
+      <div style="display:inline-block;padding:8px 20px;border-radius:30px;background:${color}22;border:1px solid ${color}66;font-size:16px;font-weight:700;letter-spacing:1px;color:${color};margin-bottom:24px;">
+        ${label}
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:20px;">
+        ${player.role==='impostor'?'Un imposteur a été démasqué !':player.role==='mrwhite'?'M. White doit maintenant deviner le mot !':'Un innocent a été éliminé...'}
+      </div>
+      <button class="btn btn-primary" onclick="this.closest('[data-elim-overlay]').remove();(window._eliminCallback&&window._eliminCallback());" style="max-width:200px;">
+        Continuer
+      </button>
+    </div>
+  `;
+  overlay.setAttribute('data-elim-overlay', '1');
+  window._eliminCallback = callback;
+  document.body.appendChild(overlay);
 }
 
 function showMrWhiteModal(player) {
