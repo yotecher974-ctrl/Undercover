@@ -1,4 +1,4 @@
-const CACHE = 'undercover-v3.2.2';
+const CACHE = 'undercover-v3.2.3';
 const ASSETS = ['./', './index.html', './manifest.json'];
 
 self.addEventListener('install', e => {
