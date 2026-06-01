@@ -1079,8 +1079,10 @@ async function send(action) {
       });
       await advanceClue(myId);
     } else {
-      // Le non-hôte signale via pendingClue uniquement (l'hôte écrira dans clues)
+      // Le non-hôte écrit DIRECTEMENT dans clues (visible par tous immédiatement)
+      // ET signale pendingClue pour que l'hôte avance le tour
       await fbUpdate(`/rooms/${roomCode}`, {
+        [`clues/${myId}`]: action.clue,
         pendingClue: { from: myId, clue: action.clue, ts: Date.now() },
         _v: Date.now() + (Math.random() * 999 | 0)
       });
@@ -1174,6 +1176,8 @@ async function advanceClue(fromId) {
   const order = room.clueOrder || [];
   const currentExpected = order[room.clueIndex];
   if (currentExpected !== fromId) return;
+  // Vérifier que l'indice est bien présent avant d'avancer
+  if (!(room.clues || {})[fromId]) return;
   const newIndex = room.clueIndex + 1;
   if (newIndex >= order.length) {
     // Merge current clues into allClues before moving to discussion
@@ -1330,13 +1334,10 @@ async function onRoomState(room) {
       const expected = order[room.clueIndex];
 
       // On accepte uniquement le joueur attendu
-      if (
-        pending.from === expected &&
-        !((room.clues || {})[pending.from])
-      ) {
-        // Sauvegarde immédiate de l'indice + effacement pendingClue + avance
+      if (pending.from === expected) {
+        // L'indice est déjà dans clues/ (écrit par le joueur lui-même)
+        // L'hôte efface juste pendingClue et avance le tour
         await fbUpdate(`/rooms/${roomCode}`, {
-          [`clues/${pending.from}`]: pending.clue,
           pendingClue: null,
           _v: Date.now() + (Math.random() * 999 | 0)
         });
@@ -1747,7 +1748,8 @@ function renderCluesPhase(room, isAlive, me) {
   // Afficher les indices de la manche en cours
   order.forEach(pid => {
     const player = allPlayers.find(p => p.id === pid);
-    const clue = clues[pid];
+    // Indice confirmé dans clues, ou encore en pendingClue (filet de sécurité visuel)
+    const clue = clues[pid] || (room.pendingClue?.from === pid ? room.pendingClue.clue : null);
 
     if (!player || !clue) return;
 
