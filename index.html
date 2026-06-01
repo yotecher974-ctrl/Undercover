@@ -1072,14 +1072,10 @@ async function send(action) {
   }
   else if (action.type === 'send_clue') {
     if (isHost) {
-      // L'hôte écrit directement dans clues et avance
-      await fbUpdate(`/rooms/${roomCode}`, {
-        [`clues/${myId}`]: action.clue,
-        _v: Date.now() + (Math.random() * 999 | 0)
-      });
-      await advanceClue(myId);
+      // L'hôte passe son indice directement à advanceClue (écriture + avancement atomiques)
+      await advanceClue(myId, action.clue);
     } else {
-      // Le non-hôte écrit DIRECTEMENT dans clues (visible par tous immédiatement)
+      // Le non-hôte écrit son indice dans clues/ (visible par tous immédiatement)
       // ET signale pendingClue pour que l'hôte avance le tour
       await fbUpdate(`/rooms/${roomCode}`, {
         [`clues/${myId}`]: action.clue,
@@ -1170,24 +1166,38 @@ async function hostDoStartClues(room) {
   });
 }
 
-async function advanceClue(fromId) {
+async function advanceClue(fromId, clueText) {
   const room = await fbGet(`/rooms/${roomCode}`);
   if (!room || room.phase !== 'clues') return;
   const order = room.clueOrder || [];
   const currentExpected = order[room.clueIndex];
   if (currentExpected !== fromId) return;
-  // Vérifier que l'indice est bien présent avant d'avancer
-  if (!(room.clues || {})[fromId]) return;
+
+  // clueText fourni directement (depuis pendingClue) = pas besoin de le relire
+  const resolvedClue = clueText || (room.clues || {})[fromId];
+  // Si on n'a toujours pas l'indice, on abandonne
+  if (!resolvedClue) return;
+
   const newIndex = room.clueIndex + 1;
   if (newIndex >= order.length) {
-    // Merge current clues into allClues before moving to discussion
-    const existingAllClues = room.allClues || {};
-    const currentClues = room.clues || {};
-    const merged = { ...existingAllClues, ...currentClues };
-    await fbUpdate(`/rooms/${roomCode}`, { allClues: merged, _v: Date.now() + (Math.random() * 999 | 0) });
+    // Tout le monde a joué : fusionner dans allClues et passer en discussion
+    const cluesMerged = { ...(room.clues || {}), [fromId]: resolvedClue };
+    const allMerged = { ...(room.allClues || {}), ...cluesMerged };
+    await fbUpdate(`/rooms/${roomCode}`, {
+      [`clues/${fromId}`]: resolvedClue,
+      pendingClue: null,
+      allClues: allMerged,
+      _v: Date.now() + (Math.random() * 999 | 0)
+    });
     await hostDoStartDiscussion();
   } else {
-    await fbUpdate(`/rooms/${roomCode}`, { clueIndex: newIndex, _v: Date.now() + (Math.random() * 999 | 0) });
+    // Avancer au joueur suivant — tout en un seul update atomique
+    await fbUpdate(`/rooms/${roomCode}`, {
+      [`clues/${fromId}`]: resolvedClue,
+      pendingClue: null,
+      clueIndex: newIndex,
+      _v: Date.now() + (Math.random() * 999 | 0)
+    });
   }
 }
 
@@ -1335,13 +1345,8 @@ async function onRoomState(room) {
 
       // On accepte uniquement le joueur attendu
       if (pending.from === expected) {
-        // L'indice est déjà dans clues/ (écrit par le joueur lui-même)
-        // L'hôte efface juste pendingClue et avance le tour
-        await fbUpdate(`/rooms/${roomCode}`, {
-          pendingClue: null,
-          _v: Date.now() + (Math.random() * 999 | 0)
-        });
-        await advanceClue(pending.from);
+        // Écrire l'indice (au cas où), effacer pendingClue et avancer — tout en une seule passe
+        await advanceClue(pending.from, pending.clue);
       }
     }
   }
